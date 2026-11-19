@@ -10,7 +10,7 @@ namespace vguest {
 
 enum class ExitPatchKind {
     kNone,
-    kRestoreRegOnly,     // Restore original register value after rewritten path pointer
+    kRestoreRegOnly,     // Restore original register(s) after rewritten path/sockaddr pointer
     kPatchStatBuf,       // Patch struct stat (newfstatat) from VfsMetaDb
     kPatchStatxBuf,      // Patch struct statx from VfsMetaDb
     kStripRootfsGetcwd,  // Rewrite getcwd() output buffer to strip host rootfs prefix
@@ -21,6 +21,8 @@ struct PendingExitOp {
     ExitPatchKind kind = ExitPatchKind::kNone;
     int saved_reg_index = -1;
     uint64_t saved_reg_val = 0;
+    int saved_reg_index2 = -1;
+    uint64_t saved_reg_val2 = 0;
     uint64_t out_buf_addr = 0;
     uint64_t out_buf_len = 0;
     std::string guest_path;

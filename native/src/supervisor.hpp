@@ -6,6 +6,7 @@
 
 #include "cred_table.hpp"
 #include "path_translator.hpp"
+#include "prop_service.hpp"
 #include "pseudo_fs.hpp"
 #include "seccomp_bpf.hpp"
 #include "vfs_meta_format.hpp"
@@ -17,6 +18,7 @@ struct SupervisorConfig {
     std::string meta_db_path;
     InterceptionTransport transport = InterceptionTransport::kAuto;
     VirtualCreds initial_creds;
+    bool enable_property_service = true;
     bool verbose = false;
 };
 
@@ -24,9 +26,8 @@ class Supervisor {
 public:
     explicit Supervisor(SupervisorConfig cfg);
 
-    // Loads VfsMetaDb, configures PR_SET_CHILD_SUBREAPER, spawns the guest command,
-    // and runs the interception loop until the guest root process exits.
-    // Returns the guest's exit code (or 128+sig).
+    // Starts PropertyService, loads VfsMetaDb, configures PR_SET_CHILD_SUBREAPER,
+    // spawns the guest command, and runs the interception loop until exit.
     int run(const std::vector<std::string>& guest_argv,
             const std::vector<std::string>& guest_env);
 
@@ -41,13 +42,13 @@ private:
     bool write_guest_mem(pid_t pid, uint64_t addr, const void* data, size_t len) const;
     bool read_guest_cstring(pid_t pid, uint64_t addr, std::string& out, size_t max_len = 4096) const;
 
-    // Inspects an ELF64 binary on host disk for PT_INTERP (e.g. /system/bin/linker64).
     static std::string read_elf_interp(const std::string& host_binary_path);
 
     SupervisorConfig cfg_;
     VfsMetaDb meta_db_;
     PathTranslator translator_;
     PseudoFs pseudo_fs_;
+    PropertyService prop_service_;
     ProcessRegistry registry_;
 };
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <elf.h>
@@ -15,6 +16,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
+#include <sys/un.h>
 #include <sys/user.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -63,7 +65,6 @@ namespace vguest {
 
 namespace {
 
-// Portable register wrapper supporting AArch64 (Tab S7+) and x86_64 (GitHub Actions CI).
 struct ArchRegs {
 #if defined(__aarch64__)
     struct user_pt_regs r {};
@@ -134,7 +135,6 @@ struct ArchRegs {
 #endif
 };
 
-// Allocates a safe scratch address below guest SP (past red zone, 16-byte aligned).
 uint64_t scratch_addr_below_sp(uint64_t sp, size_t len) {
     uint64_t aligned = (len + 15ULL) & ~15ULL;
     return (sp - 256ULL - aligned) & ~15ULL;
@@ -145,7 +145,8 @@ uint64_t scratch_addr_below_sp(uint64_t sp, size_t len) {
 Supervisor::Supervisor(SupervisorConfig cfg)
     : cfg_(std::move(cfg)),
       translator_(cfg_.rootfs_root),
-      pseudo_fs_(cfg_.rootfs_root) {}
+      pseudo_fs_(cfg_.rootfs_root),
+      prop_service_(cfg_.rootfs_root) {}
 
 bool Supervisor::read_guest_mem(pid_t pid, uint64_t addr, void* out, size_t len) const {
     if (len == 0) return true;
@@ -154,7 +155,6 @@ bool Supervisor::read_guest_mem(pid_t pid, uint64_t addr, void* out, size_t len)
     ssize_t n = ::process_vm_readv(pid, &local, 1, &remote, 1, 0);
     if (n == static_cast<ssize_t>(len)) return true;
 
-    // Fallback to PTRACE_PEEKDATA when process_vm_readv is restricted
     auto* dst = reinterpret_cast<uint8_t*>(out);
     size_t off = 0;
     while (off < len) {
@@ -175,7 +175,6 @@ bool Supervisor::write_guest_mem(pid_t pid, uint64_t addr, const void* data, siz
     ssize_t n = ::process_vm_writev(pid, &local, 1, &remote, 1, 0);
     if (n == static_cast<ssize_t>(len)) return true;
 
-    // Fallback to PTRACE_POKEDATA
     const auto* src = reinterpret_cast<const uint8_t*>(data);
     size_t off = 0;
     while (off < len) {
@@ -203,7 +202,6 @@ bool Supervisor::read_guest_cstring(pid_t pid, uint64_t addr, std::string& out,
     char chunk[256];
     while (out.size() < max_len) {
         size_t want = std::min(sizeof(chunk), max_len - out.size());
-        // Stop at page boundary to avoid reading into unmapped page
         uint64_t cur = addr + out.size();
         size_t to_page_end = 4096U - static_cast<size_t>(cur & 4095ULL);
         want = std::min(want, to_page_end);
@@ -245,10 +243,17 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
                     const std::vector<std::string>& guest_env) {
     if (guest_argv.empty()) return 1;
 
-    // 1. Configure sub-reaper so double-forked guest daemons never leak to host init
     ::prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 
-    // 2. Load VfsMetaDb if provided
+    if (cfg_.enable_property_service) {
+        if (!prop_service_.start()) {
+            std::fprintf(stderr, "[guest_runner] warning: failed to start PropertyService\n");
+        } else if (cfg_.verbose) {
+            std::fprintf(stderr, "[guest_runner] PropertyService listening on %s\n",
+                         prop_service_.socket_path().c_str());
+        }
+    }
+
     if (!cfg_.meta_db_path.empty()) {
         if (!meta_db_.open(cfg_.meta_db_path.c_str())) {
             std::fprintf(stderr, "[guest_runner] warning: failed to open %s\n",
@@ -259,12 +264,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
         }
     }
 
-    // 3. Select transport (Kernel 4.19.x automatically uses SECCOMP_RET_TRACE)
     InterceptionTransport active = select_transport(cfg_.transport);
-    // In Phase 2, full path-pointer rewriting (openat/stat/execve/getcwd) requires ptrace
-    // on kernels without SECCOMP_IOCTL_NOTIF_ADDFD. Default kAuto to kPtraceTrace for
-    // deterministic full-VFS emulation across both 4.19.x and 5.x kernels unless explicitly
-    // requesting kUserNotif mode.
     if (cfg_.transport == InterceptionTransport::kAuto) {
         active = InterceptionTransport::kPtraceTrace;
     }
@@ -276,7 +276,6 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
                      cfg_.rootfs_root.c_str());
     }
 
-    // Resolve initial executable & check PT_INTERP so guest's own linker64 is used
     TranslatedPath entry_bin = translator_.translate_absolute(guest_argv[0], true);
     std::string interp_guest = read_elf_interp(entry_bin.host_path);
 
@@ -285,7 +284,6 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     if (!interp_guest.empty()) {
         TranslatedPath interp_tp = translator_.translate_absolute(interp_guest, true);
         if (::access(interp_tp.host_path.c_str(), X_OK) == 0) {
-            // Invoke guest's own linker64 directly: linker64 <host_bin> [guest_args...]
             host_exec_target = interp_tp.host_path;
             exec_args.push_back(interp_tp.host_path);
             exec_args.push_back(entry_bin.host_path);
@@ -304,22 +302,24 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     int sockpair[2] = {-1, -1};
     if (active == InterceptionTransport::kUserNotif) {
         if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockpair) != 0) {
+            prop_service_.stop();
             return 1;
         }
     }
 
     pid_t child = ::fork();
-    if (child < 0) return 1;
+    if (child < 0) {
+        prop_service_.stop();
+        return 1;
+    }
 
     if (child == 0) {
         ::prctl(PR_SET_PDEATHSIG, SIGKILL);
-        if (::chdir(cfg_.rootfs_root.c_str()) != 0) {
-            _exit(126);
-        }
+        if (::chdir(cfg_.rootfs_root.c_str()) != 0) _exit(126);
 
         if (active == InterceptionTransport::kPtraceTrace) {
             if (::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) != 0) _exit(126);
-            ::raise(SIGSTOP);  // Synchronize with supervisor PTRACE_SETOPTIONS
+            ::raise(SIGSTOP);
             auto prog = build_seccomp_filter(SECCOMP_RET_TRACE);
             if (install_seccomp_filter(prog, false) != 0) _exit(126);
         } else {
@@ -327,7 +327,6 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
             auto prog = build_seccomp_filter(SECCOMP_RET_USER_NOTIF);
             int lfd = install_seccomp_filter(prog, true);
             if (lfd < 0) _exit(126);
-            // Pass listener_fd to supervisor via SCM_RIGHTS
             char dummy = 'L';
             struct iovec iov { &dummy, 1 };
             union {
@@ -365,6 +364,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
         _exit(127);
     }
 
+    int rc = 0;
     if (active == InterceptionTransport::kUserNotif) {
         ::close(sockpair[1]);
         char dummy = 0;
@@ -386,10 +386,13 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
             }
         }
         ::close(sockpair[0]);
-        return run_user_notif_loop(child, listener_fd);
+        rc = run_user_notif_loop(child, listener_fd);
+    } else {
+        rc = run_ptrace_loop(child);
     }
 
-    return run_ptrace_loop(child);
+    prop_service_.stop();
+    return rc;
 }
 
 int Supervisor::run_ptrace_loop(pid_t root_child) {
@@ -535,15 +538,64 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         return;
     }
 
-    // --- 3. getcwd: intercept exit to strip host rootfs prefix ---
-    if (nr == SYS_getcwd) {
-        proc.expecting_syscall_exit = true;
-        proc.exit_op = PendingExitOp{ExitPatchKind::kStripRootfsGetcwd, -1, 0,
-                                     regs.arg(0), regs.arg(1), ""};
+    // --- 3. AF_UNIX connect/bind redirection (routes /dev/socket/property_service & @zygote) ---
+    if (nr == SYS_connect || nr == SYS_bind) {
+        uint64_t addr_ptr = regs.arg(1);
+        uint64_t addr_len = regs.arg(2);
+        if (addr_ptr != 0 && addr_len > offsetof(struct sockaddr_un, sun_path) &&
+            addr_len <= sizeof(struct sockaddr_un)) {
+            struct sockaddr_un sa {};
+            if (read_guest_mem(pid, addr_ptr, &sa, static_cast<size_t>(addr_len)) &&
+                sa.sun_family == AF_UNIX) {
+                size_t path_bytes = static_cast<size_t>(addr_len) - offsetof(struct sockaddr_un, sun_path);
+                bool is_abstract = (path_bytes > 0 && sa.sun_path[0] == '\0');
+                struct sockaddr_un out_sa {};
+                out_sa.sun_family = AF_UNIX;
+                uint64_t new_len = 0;
+
+                if (is_abstract && path_bytes > 1) {
+                    std::string_view raw_abs(sa.sun_path + 1, path_bytes - 1);
+                    std::string ns_abs = translator_.translate_unix_socket(raw_abs, true);
+                    size_t copy_len = std::min(ns_abs.size(), sizeof(out_sa.sun_path) - 1);
+                    out_sa.sun_path[0] = '\0';
+                    std::memcpy(out_sa.sun_path + 1, ns_abs.data(), copy_len);
+                    new_len = offsetof(struct sockaddr_un, sun_path) + 1 + copy_len;
+                } else if (!is_abstract) {
+                    size_t slen = ::strnlen(sa.sun_path, path_bytes);
+                    std::string host_sock = translator_.translate_unix_socket(
+                        std::string_view(sa.sun_path, slen), false);
+                    if (host_sock.size() < sizeof(out_sa.sun_path)) {
+                        std::memcpy(out_sa.sun_path, host_sock.data(), host_sock.size());
+                        out_sa.sun_path[host_sock.size()] = '\0';
+                        new_len = offsetof(struct sockaddr_un, sun_path) + host_sock.size() + 1;
+                    }
+                }
+
+                if (new_len > 0) {
+                    uint64_t scratch = scratch_addr_below_sp(regs.sp(), sizeof(out_sa));
+                    if (write_guest_mem(pid, scratch, &out_sa, static_cast<size_t>(new_len))) {
+                        regs.set_arg(1, scratch);
+                        regs.set_arg(2, new_len);
+                        regs.store(pid);
+                        proc.expecting_syscall_exit = true;
+                        proc.exit_op = PendingExitOp{ExitPatchKind::kRestoreRegOnly,
+                                                     1, addr_ptr, 2, addr_len, 0, 0, ""};
+                    }
+                }
+            }
+        }
         return;
     }
 
-    // --- 4. Path-Based Syscall Redirection ---
+    // --- 4. getcwd: intercept exit to strip host rootfs prefix ---
+    if (nr == SYS_getcwd) {
+        proc.expecting_syscall_exit = true;
+        proc.exit_op = PendingExitOp{ExitPatchKind::kStripRootfsGetcwd,
+                                     -1, 0, -1, 0, regs.arg(0), regs.arg(1), ""};
+        return;
+    }
+
+    // --- 5. Path-Based Syscall Redirection ---
     auto rewrite_path_arg = [&](int dirfd_arg_idx, int path_arg_idx, bool follow_final,
                                 ExitPatchKind exit_kind, uint64_t out_buf, uint64_t out_len) {
         std::string raw_path;
@@ -553,7 +605,6 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         TranslatedPath tp = translator_.translate(pid, dirfd, raw_path, follow_final);
         if (tp.kind == PathKind::kHostPassThru) return;
 
-        // Write translated host path into guest scratch area below SP
         std::string with_nul = tp.host_path;
         with_nul.push_back('\0');
         uint64_t scratch = scratch_addr_below_sp(regs.sp(), with_nul.size());
@@ -565,7 +616,7 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
 
         proc.expecting_syscall_exit = true;
         proc.exit_op = PendingExitOp{exit_kind, path_arg_idx, orig_ptr,
-                                     out_buf, out_len, tp.guest_path};
+                                     -1, 0, out_buf, out_len, tp.guest_path};
     };
 
     if (nr == SYS_openat) {
@@ -613,10 +664,16 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
     ArchRegs regs;
     if (!regs.load(pid)) return;
 
+    bool reg_dirty = false;
     if (op.saved_reg_index >= 0) {
         regs.set_arg(op.saved_reg_index, op.saved_reg_val);
-        regs.store(pid);
+        reg_dirty = true;
     }
+    if (op.saved_reg_index2 >= 0) {
+        regs.set_arg(op.saved_reg_index2, op.saved_reg_val2);
+        reg_dirty = true;
+    }
+    if (reg_dirty) regs.store(pid);
 
     if (regs.ret() < 0) return;
 
@@ -674,7 +731,6 @@ int Supervisor::run_user_notif_loop(pid_t root_child, int listener_fd) {
         std::memset(&resp, 0, sizeof(resp));
         resp.id = req.id;
 
-        // Validate notification cookie before touching guest state (TOCTOU defense)
         uint64_t id_check = req.id;
         if (::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id_check) != 0) {
             continue;
