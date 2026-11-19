@@ -361,6 +361,8 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
 
         ::execve(host_exec_target.c_str(), c_argv.data(),
                  guest_env.empty() ? environ : c_env.data());
+        std::fprintf(stderr, "[guest_runner] execve(%s) failed: errno=%d (%s)\n",
+                     host_exec_target.c_str(), errno, std::strerror(errno));
         _exit(127);
     }
 
@@ -605,7 +607,24 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         TranslatedPath tp = translator_.translate(pid, dirfd, raw_path, follow_final);
         if (tp.kind == PathKind::kHostPassThru) return;
 
-        std::string with_nul = tp.host_path;
+        std::string target_host = tp.host_path;
+        if (tp.kind == PathKind::kVirtualProc || tp.kind == PathKind::kVirtualSys) {
+            std::string content = pseudo_fs_.generate_content(pid, tp.guest_path, proc.creds);
+            if (!content.empty()) {
+                static uint32_t vseq = 0;
+                std::string tmp_path = cfg_.rootfs_root + "/tmp/.vproc_" +
+                                       std::to_string(static_cast<int>(pid)) + "_" +
+                                       std::to_string(++vseq);
+                int tfd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+                if (tfd >= 0) {
+                    (void)::write(tfd, content.data(), content.size());
+                    ::close(tfd);
+                    target_host = tmp_path;
+                }
+            }
+        }
+
+        std::string with_nul = target_host;
         with_nul.push_back('\0');
         uint64_t scratch = scratch_addr_below_sp(regs.sp(), with_nul.size());
         if (!write_guest_mem(pid, scratch, with_nul.data(), with_nul.size())) return;

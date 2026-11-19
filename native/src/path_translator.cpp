@@ -192,6 +192,11 @@ std::string PathTranslator::resolve_symlinks_in_rootfs(std::string_view guest_ab
 TranslatedPath PathTranslator::translate_absolute(std::string_view guest_abs,
                                                   bool follow_final_symlink) const {
     std::string norm = normalize_posix(guest_abs);
+    if (norm == rootfs_root_ ||
+        (starts_with(norm, rootfs_root_) && norm.size() > rootfs_root_.size() &&
+         norm[rootfs_root_.size()] == '/')) {
+        norm = host_to_guest(norm);
+    }
     PathKind initial_kind = classify_guest_path(norm);
     if (initial_kind != PathKind::kNormalRootfs) {
         return TranslatedPath{initial_kind, norm, norm};
