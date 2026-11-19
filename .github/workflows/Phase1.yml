@@ -1,0 +1,148 @@
+name: Phase 1 — AOSP 12 GSI Prep & Verification
+
+on:
+  push:
+    paths:
+      - "tools/gsi_prepare.py"
+      - "include/vfs_meta_format.hpp"
+      - "tests/test_phase1.py"
+      - ".github/workflows/phase1-gsi-prep.yml"
+  pull_request:
+    paths:
+      - "tools/gsi_prepare.py"
+      - "include/vfs_meta_format.hpp"
+      - "tests/test_phase1.py"
+  workflow_dispatch:
+    inputs:
+      gsi_url:
+        description: "Direct download URL to AOSP 12 ARM64 GSI (.img, .img.xz, .img.gz, or .zip)"
+        required: true
+        type: string
+      zstd_level:
+        description: "zstd compression level (3=fast, 12=balanced, 19=smallest)"
+        required: false
+        default: "12"
+        type: string
+      publish_release:
+        description: "Also publish rootfs bundle to a GitHub Release"
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "Release tag (used only when publish_release=true)"
+        required: false
+        default: "rootfs-aosp12-arm64"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # Fast CI gate on every push/PR: tests sparse ext4, APEX flattening, ELF64 audit & C++17 header
+  unit-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install e2fsprogs & g++
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs g++
+
+      - name: Run Phase 1 synthetic sparse-ext4 & C++17 VfsMetaDb tests
+        run: python3 tests/test_phase1.py
+
+  # On-demand heavy job: downloads AOSP 12 GSI, flattens APEXes, verifies, and packages tar.zst
+  prepare-gsi-rootfs:
+    if: github.event_name == 'workflow_dispatch'
+    needs: unit-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Reclaim runner disk space for GSI extraction
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Install compression tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd xz-utils unzip curl
+
+      - name: Download & unpack AOSP 12 GSI image
+        env:
+          GSI_URL: ${{ inputs.gsi_url }}
+        run: |
+          mkdir -p work/dl work/out
+          curl -fL --retry 3 -o work/dl/gsi_archive "$GSI_URL"
+          FILE_TYPE=$(file -b work/dl/gsi_archive)
+          echo "Downloaded file type: $FILE_TYPE"
+
+          if echo "$FILE_TYPE" | grep -qi "XZ compressed"; then
+            xz -d -T0 -c work/dl/gsi_archive > work/dl/system.img
+            rm -f work/dl/gsi_archive
+          elif echo "$FILE_TYPE" | grep -qi "gzip compressed"; then
+            gzip -d -c work/dl/gsi_archive > work/dl/system.img
+            rm -f work/dl/gsi_archive
+          elif echo "$FILE_TYPE" | grep -qi "Zip archive"; then
+            unzip -o work/dl/gsi_archive -d work/dl/unzipped
+            rm -f work/dl/gsi_archive
+            IMG_FOUND=$(find work/dl/unzipped -type f -name "*.img" | head -n 1)
+            if [ -z "$IMG_FOUND" ]; then
+              echo "::error::No .img file found inside downloaded ZIP archive"
+              exit 1
+            fi
+            mv "$IMG_FOUND" work/dl/system.img
+            rm -rf work/dl/unzipped
+          else
+            mv work/dl/gsi_archive work/dl/system.img
+          fi
+          ls -lh work/dl/system.img
+
+      - name: Run Phase 1 unprivileged extractor, APEX flattener & ELF64 audit
+        run: |
+          python3 tools/gsi_prepare.py \
+            work/dl/system.img \
+            work/out/rootfs \
+            --meta-db work/out/rootfs_meta.db
+          rm -f work/dl/system.img
+
+      - name: Package flattened rootfs & rootfs_meta.db (tar.zst)
+        env:
+          ZSTD_LEVEL: ${{ inputs.zstd_level }}
+        run: |
+          mkdir -p work/dist
+          tar -C work/out -cf - rootfs rootfs_meta.db \
+            | zstd -T0 -"${ZSTD_LEVEL}" -o work/dist/aosp12-arm64-rootfs.tar.zst
+
+          # GitHub Releases cap single assets at 2 GiB; split only if exceeded
+          SIZE_BYTES=$(stat -c%s work/dist/aosp12-arm64-rootfs.tar.zst)
+          MAX_BYTES=$((1900 * 1024 * 1024))
+          if [ "$SIZE_BYTES" -gt "$MAX_BYTES" ]; then
+            echo "Bundle exceeds 1.9 GiB ($SIZE_BYTES bytes); splitting into 1.8 GiB parts"
+            split -b 1800M -d work/dist/aosp12-arm64-rootfs.tar.zst work/dist/aosp12-arm64-rootfs.tar.zst.part
+            rm -f work/dist/aosp12-arm64-rootfs.tar.zst
+          fi
+
+          (cd work/dist && sha256sum * > SHA256SUMS.txt)
+          ls -lh work/dist/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aosp12-arm64-rootfs
+          path: work/dist/*
+          retention-days: 14
+
+      - name: Publish GitHub Release (optional)
+        if: inputs.publish_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: "AOSP 12 ARM64 Flattened Rootfs (${{ inputs.release_tag }})"
+          files: work/dist/*
+          
