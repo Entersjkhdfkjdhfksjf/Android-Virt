@@ -86,7 +86,7 @@ std::vector<uint32_t> intercepted_syscalls() {
         SYS_unshare,
         SYS_sethostname,
         SYS_setdomainname,
-        // Sockets & prctl
+        // Sockets
         SYS_bind,
         SYS_connect,
     };
@@ -139,8 +139,6 @@ InterceptionTransport select_transport(InterceptionTransport requested) noexcept
         return probe_seccomp_user_notif() ? InterceptionTransport::kUserNotif
                                           : InterceptionTransport::kPtraceTrace;
     }
-    // kAuto: Prefer ptrace-backed SECCOMP_RET_TRACE on 4.19.x (where user_notif is absent)
-    // and also use SECCOMP_RET_TRACE when full memory-rewrite path translation is needed.
     return probe_seccomp_user_notif() ? InterceptionTransport::kUserNotif
                                       : InterceptionTransport::kPtraceTrace;
 }
@@ -148,13 +146,11 @@ InterceptionTransport select_transport(InterceptionTransport requested) noexcept
 std::vector<struct sock_filter> build_seccomp_filter(uint32_t trap_action) {
     const auto nrs = intercepted_syscalls();
     std::vector<struct sock_filter> prog;
-    prog.reserve(nrs.size() + 6);
+    prog.reserve(nrs.size() + 14);
 
-    // 1. Validate architecture == host arch; otherwise ALLOW (let kernel handle)
+    // 1. Validate architecture == host arch; otherwise ALLOW
     prog.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                             static_cast<uint32_t>(offsetof(struct seccomp_data, arch))));
-    // Jump over syscall checks to ALLOW if arch mismatch
-    // We emit ALLOW at index (prog.size() + nrs.size() + 2)
     prog.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, kHostAuditArch, 1, 0));
     prog.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
 
@@ -162,19 +158,34 @@ std::vector<struct sock_filter> build_seccomp_filter(uint32_t trap_action) {
     prog.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
                             static_cast<uint32_t>(offsetof(struct seccomp_data, nr))));
 
-    // 3. Emit linear dispatch to TRAP label (placed right after ALLOW)
-    // Total instructions after this loop:
-    //   [end + 0]: RET SECCOMP_RET_ALLOW
-    //   [end + 1]: RET trap_action
+    // 3. Fast in-kernel sub-filter for SYS_ioctl:
+    //    Only trap Binder ('b' = 0x62) and Input evdev ('E' = 0x45) ioctl type bytes;
+    //    all other ioctls (TTY, socket, pipe) pass natively at zero overhead.
+    //    [+0] JEQ SYS_ioctl -> jt=0 (enter subfilter), jf=5 (skip subfilter)
+    //    [+1] LD args[1] (low 32 bits of ioctl cmd on little-endian)
+    //    [+2] ALU AND 0xFF00 (isolate _IOC_TYPE byte)
+    //    [+3] JEQ ('b' << 8) -> jt=2 (RET trap_action), jf=0
+    //    [+4] JEQ ('E' << 8) -> jt=1 (RET trap_action), jf=0
+    //    [+5] RET SECCOMP_RET_ALLOW
+    //    [+6] RET trap_action
+    //    Wait: jf=6 skips all 6 instructions [+1..+6] to the main syscall table!
+    prog.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_ioctl, 0, 6));
+    prog.push_back(BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                            static_cast<uint32_t>(offsetof(struct seccomp_data, args[1]))));
+    prog.push_back(BPF_STMT(BPF_ALU | BPF_AND | BPF_K, 0x0000FF00U));
+    prog.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>('b') << 8, 2, 0));
+    prog.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, static_cast<uint32_t>('E') << 8, 1, 0));
+    prog.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
+    prog.push_back(BPF_STMT(BPF_RET | BPF_K, trap_action));
+
+    // 4. Linear dispatch for remaining intercepted syscalls
     const size_t count = nrs.size();
     for (size_t i = 0; i < count; ++i) {
-        uint8_t jt = static_cast<uint8_t>((count - 1 - i) + 1);  // Jump to RET trap_action
+        uint8_t jt = static_cast<uint8_t>((count - 1 - i) + 1);
         prog.push_back(BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, nrs[i], jt, 0));
     }
 
-    // Default fast-path: native execution
     prog.push_back(BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
-    // Intercepted path
     prog.push_back(BPF_STMT(BPF_RET | BPF_K, trap_action));
     return prog;
 }

@@ -27,6 +27,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cmdInput: EditText
     private lateinit var importBtn: Button
     private lateinit var selfTestBtn: Button
+    private lateinit var binderTestBtn: Button
     private lateinit var runBtn: Button
 
     private val rootfsDir: File get() = File(filesDir, "rootfs")
@@ -49,7 +50,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "VGuest AOSP 12 — Phase 2/3 Verification Console"
+            text = "VGuest AOSP 12 — Phase 4 Verification Console"
             setTextColor(Color.parseColor("#E6EDF3"))
             textSize = 20f
             setTypeface(Typeface.SANS_SERIF, Typeface.BOLD)
@@ -74,15 +75,20 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { pickRootfsLauncher.launch(arrayOf("*/*")) }
         }
         selfTestBtn = Button(this).apply {
-            text = "Run Phase 2+3 Self-Test"
+            text = "Phase 2+3 Test"
             setOnClickListener { runPhase23SelfTest() }
         }
+        binderTestBtn = Button(this).apply {
+            text = "Phase 4 Binder Test"
+            setOnClickListener { runPhase4BinderTest() }
+        }
         val clearBtn = Button(this).apply {
-            text = "Clear Log"
+            text = "Clear"
             setOnClickListener { logView.text = "" }
         }
         btnRow.addView(importBtn)
         btnRow.addView(selfTestBtn)
+        btnRow.addView(binderTestBtn)
         btnRow.addView(clearBtn)
         root.addView(btnRow)
 
@@ -130,7 +136,7 @@ class MainActivity : AppCompatActivity() {
 
         setContentView(root)
         refreshStatus()
-        appendLog("Ready. Import aosp12-arm64-rootfs.tar.zst, then tap 'Run Phase 2+3 Self-Test'.")
+        appendLog("Ready. Tap 'Phase 4 Binder Test' to launch servicemanager & query 'service list'.")
     }
 
     private fun refreshStatus() {
@@ -141,13 +147,14 @@ class MainActivity : AppCompatActivity() {
         statusView.text = "runner=${if (hasRunner) "OK" else "MISSING"} | " +
             "rootfs=${if (hasRootfs) "READY" else "NOT IMPORTED"} | " +
             "meta_db=${if (hasDb) "OK" else "MISSING"} | " +
-            "prop_sock_len=${sockLen}B (<108B)"
+            "prop_sock_len=${sockLen}B"
     }
 
     private fun setBusy(busy: Boolean) {
         runOnUiThread {
             importBtn.isEnabled = !busy
             selfTestBtn.isEnabled = !busy
+            binderTestBtn.isEnabled = !busy
             runBtn.isEnabled = !busy
         }
     }
@@ -182,12 +189,25 @@ class MainActivity : AppCompatActivity() {
             "id; pwd",
             "echo '--- [2] Flattened APEX Modules ---'",
             "ls /apex | head -n 10",
-            "echo '--- [3] Seeded Bionic Properties (getprop) ---'",
+            "echo '--- [3] Seeded Bionic Properties ---'",
             "getprop ro.build.version.sdk; getprop ro.zygote; getprop ro.hardware.gralloc",
-            "echo '--- [4] Live Property Service Write (setprop -> getprop) ---'",
+            "echo '--- [4] Live Property Service Write ---'",
             "setprop debug.vguest.ping hello_tab_s7 && getprop debug.vguest.ping",
             "echo '--- [5] Pseudo-FS SELinux & Mounts ---'",
             "cat /sys/fs/selinux/enforce; head -n 3 /proc/mounts"
+        ).joinToString("; ")
+        runGuestShell(script)
+    }
+
+    private fun runPhase4BinderTest() {
+        val script = listOf(
+            "echo '--- Starting AOSP 12 servicemanager on virtual /dev/binder ---'",
+            "/system/bin/servicemanager &",
+            "SM_PID=\$!",
+            "sleep 1",
+            "echo '--- Querying service list via virtual /dev/binder ---'",
+            "/system/bin/service list",
+            "kill \$SM_PID 2>/dev/null || true"
         ).joinToString("; ")
         runGuestShell(script)
     }

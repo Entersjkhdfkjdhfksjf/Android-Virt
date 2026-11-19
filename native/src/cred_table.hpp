@@ -10,11 +10,12 @@ namespace vguest {
 
 enum class ExitPatchKind {
     kNone,
-    kRestoreRegOnly,     // Restore original register(s) after rewritten path/sockaddr pointer
-    kPatchStatBuf,       // Patch struct stat (newfstatat) from VfsMetaDb
-    kPatchStatxBuf,      // Patch struct statx from VfsMetaDb
-    kStripRootfsGetcwd,  // Rewrite getcwd() output buffer to strip host rootfs prefix
-    kStripRootfsReadlink,// Rewrite readlinkat() output buffer if it leaked host rootfs
+    kRestoreRegOnly,      // Restore original register(s) after rewritten path/sockaddr pointer
+    kPatchStatBuf,        // Patch struct stat (newfstatat) from VfsMetaDb
+    kPatchStatxBuf,       // Patch struct statx from VfsMetaDb
+    kStripRootfsGetcwd,   // Rewrite getcwd() output buffer to strip host rootfs prefix
+    kStripRootfsReadlink, // Rewrite readlinkat() output buffer if it leaked host rootfs
+    kRegisterBinderFd,    // Register returned FD from openat("/dev/*binder") with VBinderBroker
 };
 
 struct PendingExitOp {
@@ -26,6 +27,8 @@ struct PendingExitOp {
     uint64_t out_buf_addr = 0;
     uint64_t out_buf_len = 0;
     std::string guest_path;
+    uint8_t binder_domain = 0;
+    std::string binder_backing_path;
 };
 
 struct VirtualCreds {
@@ -47,6 +50,7 @@ struct ProcessState {
     pid_t tgid = 0;
     VirtualCreds creds;
     bool expecting_syscall_exit = false;
+    bool parked_in_binder = false;
     PendingExitOp exit_op;
 };
 

@@ -15,16 +15,26 @@ android {
         @Suppress("ExpiredTargetSdkVersion")
         targetSdk = 28
         versionCode = 1
-        versionName = "0.3.0-phase3"
+        versionName = "0.4.0-phase4"
 
         ndk {
             abiFilters += listOf("arm64-v8a")
         }
     }
 
+    signingConfigs {
+        create("vguestDebug") {
+            storeFile = file("vguest-debug.keystore")
+            storePassword = "android"
+            keyAlias = "vguestdebug"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         debug {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.getByName("vguestDebug")
         }
         release {
             isMinifyEnabled = false

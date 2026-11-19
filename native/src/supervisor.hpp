@@ -9,6 +9,7 @@
 #include "prop_service.hpp"
 #include "pseudo_fs.hpp"
 #include "seccomp_bpf.hpp"
+#include "vbinder.hpp"
 #include "vfs_meta_format.hpp"
 
 namespace vguest {
@@ -26,8 +27,6 @@ class Supervisor {
 public:
     explicit Supervisor(SupervisorConfig cfg);
 
-    // Starts PropertyService, loads VfsMetaDb, configures PR_SET_CHILD_SUBREAPER,
-    // spawns the guest command, and runs the interception loop until exit.
     int run(const std::vector<std::string>& guest_argv,
             const std::vector<std::string>& guest_env);
 
@@ -37,11 +36,12 @@ private:
 
     void handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc);
     void handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc);
+    void wake_parked_binder_threads(const std::vector<pid_t>& pids);
 
     bool read_guest_mem(pid_t pid, uint64_t addr, void* out, size_t len) const;
     bool write_guest_mem(pid_t pid, uint64_t addr, const void* data, size_t len) const;
     bool read_guest_cstring(pid_t pid, uint64_t addr, std::string& out, size_t max_len = 4096) const;
-
+    static uint64_t find_guest_mmap_base(pid_t pid, const std::string& path_substr);
     static std::string read_elf_interp(const std::string& host_binary_path);
 
     SupervisorConfig cfg_;
@@ -49,6 +49,7 @@ private:
     PathTranslator translator_;
     PseudoFs pseudo_fs_;
     PropertyService prop_service_;
+    VBinderBroker vbinder_;
     ProcessRegistry registry_;
 };
 

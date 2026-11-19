@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <elf.h>
 #include <fcntl.h>
@@ -146,7 +147,30 @@ Supervisor::Supervisor(SupervisorConfig cfg)
     : cfg_(std::move(cfg)),
       translator_(cfg_.rootfs_root),
       pseudo_fs_(cfg_.rootfs_root),
-      prop_service_(cfg_.rootfs_root) {}
+      prop_service_(cfg_.rootfs_root),
+      vbinder_(cfg_.rootfs_root,
+               GuestMemOps{
+                   [this](pid_t p, uint64_t a, void* o, size_t l) { return read_guest_mem(p, a, o, l); },
+                   [this](pid_t p, uint64_t a, const void* d, size_t l) { return write_guest_mem(p, a, d, l); },
+                   [](pid_t p, const std::string& sub) { return find_guest_mmap_base(p, sub); },
+               }) {}
+
+uint64_t Supervisor::find_guest_mmap_base(pid_t pid, const std::string& path_substr) {
+    char maps_path[64];
+    std::snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", static_cast<int>(pid));
+    std::ifstream in(maps_path);
+    if (!in.is_open()) return 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.find(path_substr) != std::string::npos) {
+            size_t dash = line.find('-');
+            if (dash != std::string::npos) {
+                return std::strtoull(line.substr(0, dash).c_str(), nullptr, 16);
+            }
+        }
+    }
+    return 0;
+}
 
 bool Supervisor::read_guest_mem(pid_t pid, uint64_t addr, void* out, size_t len) const {
     if (len == 0) return true;
@@ -270,7 +294,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -397,6 +421,20 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     return rc;
 }
 
+void Supervisor::wake_parked_binder_threads(const std::vector<pid_t>& pids) {
+    for (pid_t wpid : pids) {
+        ArchRegs wregs;
+        if (wregs.load(wpid)) {
+            wregs.cancel_syscall(wpid);
+            wregs.set_ret(0);
+            wregs.store(wpid);
+        }
+        auto& wproc = registry_.get_or_create(wpid, cfg_.initial_creds);
+        wproc.parked_in_binder = false;
+        ::ptrace(PTRACE_CONT, wpid, nullptr, nullptr);
+    }
+}
+
 int Supervisor::run_ptrace_loop(pid_t root_child) {
     int status = 0;
     if (::waitpid(root_child, &status, 0) < 0) return 1;
@@ -420,14 +458,13 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
             break;
         }
 
-        if (WIFEXITED(status)) {
-            if (pid == root_child) root_exit_code = WEXITSTATUS(status);
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (pid == root_child) {
+                root_exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : (128 + WTERMSIG(status));
+            }
+            auto wakes = vbinder_.on_process_exit(pid);
             registry_.erase(pid);
-            continue;
-        }
-        if (WIFSIGNALED(status)) {
-            if (pid == root_child) root_exit_code = 128 + WTERMSIG(status);
-            registry_.erase(pid);
+            wake_parked_binder_threads(wakes);
             continue;
         }
         if (!WIFSTOPPED(status)) continue;
@@ -438,6 +475,10 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
 
         if (sig == SIGTRAP && event == PTRACE_EVENT_SECCOMP) {
             handle_ptrace_seccomp_entry(pid, proc);
+            if (proc.parked_in_binder) {
+                // Intentionally parked until a peer sends BR_TRANSACTION/BR_REPLY
+                continue;
+            }
             if (proc.expecting_syscall_exit) {
                 ::ptrace(PTRACE_SYSCALL, pid, nullptr, nullptr);
             } else {
@@ -457,6 +498,7 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
             ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
         } else if (sig == SIGTRAP && event == PTRACE_EVENT_EXEC) {
             proc.expecting_syscall_exit = false;
+            proc.parked_in_binder = false;
             proc.exit_op = PendingExitOp{};
             ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
         } else {
@@ -479,6 +521,23 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         regs.set_ret(retval);
         regs.store(pid);
     };
+
+    // --- 0. Phase 4 Virtual Binder ioctl interception ---
+    if (nr == SYS_ioctl) {
+        int fd = static_cast<int>(regs.arg(0));
+        unsigned long cmd = static_cast<unsigned long>(regs.arg(1));
+        uint64_t arg_ptr = regs.arg(2);
+        if (vbinder_.is_virtual_binder_fd(pid, fd)) {
+            BinderIoctlResult bres = vbinder_.handle_ioctl(pid, fd, cmd, arg_ptr, proc.creds.euid);
+            wake_parked_binder_threads(bres.wake_pids);
+            if (bres.park_caller) {
+                proc.parked_in_binder = true;
+                return;
+            }
+            skip_with_ret(bres.return_value);
+        }
+        return;
+    }
 
     // --- 1. Virtual Credential Getters ---
     if (nr == SYS_getuid)  { skip_with_ret(proc.creds.uid); return; }
@@ -540,7 +599,7 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         return;
     }
 
-    // --- 3. AF_UNIX connect/bind redirection (routes /dev/socket/property_service & @zygote) ---
+    // --- 3. AF_UNIX connect/bind redirection ---
     if (nr == SYS_connect || nr == SYS_bind) {
         uint64_t addr_ptr = regs.arg(1);
         uint64_t addr_len = regs.arg(2);
@@ -581,7 +640,7 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
                         regs.store(pid);
                         proc.expecting_syscall_exit = true;
                         proc.exit_op = PendingExitOp{ExitPatchKind::kRestoreRegOnly,
-                                                     1, addr_ptr, 2, addr_len, 0, 0, ""};
+                                                     1, addr_ptr, 2, addr_len, 0, 0, "", 0, ""};
                     }
                 }
             }
@@ -593,7 +652,7 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
     if (nr == SYS_getcwd) {
         proc.expecting_syscall_exit = true;
         proc.exit_op = PendingExitOp{ExitPatchKind::kStripRootfsGetcwd,
-                                     -1, 0, -1, 0, regs.arg(0), regs.arg(1), ""};
+                                     -1, 0, -1, 0, regs.arg(0), regs.arg(1), "", 0, ""};
         return;
     }
 
@@ -608,7 +667,19 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         if (tp.kind == PathKind::kHostPassThru) return;
 
         std::string target_host = tp.host_path;
-        if (tp.kind == PathKind::kVirtualProc || tp.kind == PathKind::kVirtualSys) {
+        ExitPatchKind final_exit_kind = exit_kind;
+        uint8_t bdom = 0;
+        std::string bbacking;
+
+        if (nr == SYS_openat && tp.kind == PathKind::kVirtualBinder) {
+            BinderDomain dom = BinderDomain::kBinder;
+            if (VBinderBroker::domain_from_guest_path(tp.guest_path, dom)) {
+                bbacking = vbinder_.prepare_open_backing_file(pid, dom);
+                target_host = bbacking;
+                bdom = static_cast<uint8_t>(dom);
+                final_exit_kind = ExitPatchKind::kRegisterBinderFd;
+            }
+        } else if (tp.kind == PathKind::kVirtualProc || tp.kind == PathKind::kVirtualSys) {
             std::string content = pseudo_fs_.generate_content(pid, tp.guest_path, proc.creds);
             if (!content.empty()) {
                 static uint32_t vseq = 0;
@@ -634,8 +705,8 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         regs.store(pid);
 
         proc.expecting_syscall_exit = true;
-        proc.exit_op = PendingExitOp{exit_kind, path_arg_idx, orig_ptr,
-                                     -1, 0, out_buf, out_len, tp.guest_path};
+        proc.exit_op = PendingExitOp{final_exit_kind, path_arg_idx, orig_ptr,
+                                     -1, 0, out_buf, out_len, tp.guest_path, bdom, bbacking};
     };
 
     if (nr == SYS_openat) {
@@ -695,6 +766,14 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
     if (reg_dirty) regs.store(pid);
 
     if (regs.ret() < 0) return;
+
+    if (op.kind == ExitPatchKind::kRegisterBinderFd) {
+        int returned_fd = static_cast<int>(regs.ret());
+        vbinder_.register_client_fd(pid, returned_fd,
+                                    static_cast<BinderDomain>(op.binder_domain),
+                                    op.binder_backing_path);
+        return;
+    }
 
     if (op.kind == ExitPatchKind::kPatchStatBuf && op.out_buf_addr != 0) {
         auto meta = meta_db_.find(op.guest_path);
