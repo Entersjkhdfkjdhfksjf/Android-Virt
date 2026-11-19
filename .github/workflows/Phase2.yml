@@ -1,0 +1,70 @@
+name: Phase 2 — Build & Test guest_runner (Host + Android ARM64)
+
+on:
+  push:
+    paths:
+      - "native/**"
+      - "include/**"
+      - "tests/test_phase2.cpp"
+      - ".github/workflows/phase2-build-native.yml"
+  pull_request:
+    paths:
+      - "native/**"
+      - "include/**"
+      - "tests/test_phase2.cpp"
+      - ".github/workflows/phase2-build-native.yml"
+  workflow_dispatch:
+
+jobs:
+  host-unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure & build host tests (x86_64)
+        run: |
+          cmake -S native -B build-host -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-host -j$(nproc)
+
+      - name: Run Phase 2 unit tests
+        run: ctest --test-dir build-host --output-on-failure
+
+  android-ndk-arm64:
+    needs: host-unit-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate Android NDK on runner
+        id: ndk
+        run: |
+          NDK_PATH="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
+            NDK_PATH=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)
+          fi
+          if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
+            echo "::error::Android NDK not found on runner"
+            exit 1
+          fi
+          echo "Using Android NDK: $NDK_PATH"
+          echo "ndk_path=$NDK_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-compile guest_runner for ARM64 (android-31 / Tab S7+)
+        run: |
+          cmake -S native -B build-android-arm64 \
+            -DCMAKE_TOOLCHAIN_FILE="${{ steps.ndk.outputs.ndk_path }}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-31 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-android-arm64 -j$(nproc)
+          file build-android-arm64/guest_runner
+          ls -lh build-android-arm64/guest_runner
+
+      - name: Upload ARM64 guest_runner artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: guest_runner-arm64-v8a
+          path: build-android-arm64/guest_runner
+          retention-days: 14

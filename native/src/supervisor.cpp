@@ -1,0 +1,715 @@
+#include "supervisor.hpp"
+
+#include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <elf.h>
+#include <fcntl.h>
+#include <fstream>
+#include <linux/seccomp.h>
+#include <sys/ioctl.h>
+#include <sys/prctl.h>
+#include <sys/ptrace.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/uio.h>
+#include <sys/user.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#if defined(__aarch64__)
+#include <asm/ptrace.h>
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
+#endif
+#ifndef NT_ARM_SYSTEM_CALL
+#define NT_ARM_SYSTEM_CALL 0x404
+#endif
+#endif
+
+#ifndef SECCOMP_RET_USER_NOTIF
+#define SECCOMP_RET_USER_NOTIF 0x7fc00000U
+#endif
+#ifndef SECCOMP_USER_NOTIF_FLAG_CONTINUE
+#define SECCOMP_USER_NOTIF_FLAG_CONTINUE (1UL << 0)
+#endif
+#ifndef SECCOMP_IOCTL_NOTIF_RECV
+struct seccomp_notif {
+    uint64_t id;
+    uint32_t pid;
+    uint32_t flags;
+    struct seccomp_data data;
+};
+struct seccomp_notif_resp {
+    uint64_t id;
+    int64_t val;
+    int32_t error;
+    uint32_t flags;
+};
+#define SECCOMP_IOWR(nr, type) _IOWR('!', nr, type)
+#define SECCOMP_IOW(nr, type) _IOW('!', nr, type)
+#define SECCOMP_IOCTL_NOTIF_RECV SECCOMP_IOWR(0, struct seccomp_notif)
+#define SECCOMP_IOCTL_NOTIF_SEND SECCOMP_IOWR(1, struct seccomp_notif_resp)
+#define SECCOMP_IOCTL_NOTIF_ID_VALID SECCOMP_IOW(2, uint64_t)
+#endif
+
+#ifndef PR_SET_CHILD_SUBREAPER
+#define PR_SET_CHILD_SUBREAPER 36
+#endif
+
+namespace vguest {
+
+namespace {
+
+// Portable register wrapper supporting AArch64 (Tab S7+) and x86_64 (GitHub Actions CI).
+struct ArchRegs {
+#if defined(__aarch64__)
+    struct user_pt_regs r {};
+    int64_t orig_sysno = 0;
+
+    bool load(pid_t pid) {
+        struct iovec iov { &r, sizeof(r) };
+        if (::ptrace(PTRACE_GETREGSET, pid, reinterpret_cast<void*>(NT_PRSTATUS), &iov) != 0) {
+            return false;
+        }
+        orig_sysno = static_cast<int64_t>(r.regs[8]);
+        return true;
+    }
+    bool store(pid_t pid) {
+        struct iovec iov { &r, sizeof(r) };
+        return ::ptrace(PTRACE_SETREGSET, pid, reinterpret_cast<void*>(NT_PRSTATUS), &iov) == 0;
+    }
+    bool cancel_syscall(pid_t pid) {
+        int nr = -1;
+        struct iovec iov { &nr, sizeof(nr) };
+        return ::ptrace(PTRACE_SETREGSET, pid, reinterpret_cast<void*>(NT_ARM_SYSTEM_CALL), &iov) == 0;
+    }
+    int64_t sysno() const { return orig_sysno; }
+    uint64_t arg(int idx) const { return r.regs[idx]; }
+    void set_arg(int idx, uint64_t v) { r.regs[idx] = v; }
+    int64_t ret() const { return static_cast<int64_t>(r.regs[0]); }
+    void set_ret(int64_t v) { r.regs[0] = static_cast<uint64_t>(v); }
+    uint64_t sp() const { return r.sp; }
+#elif defined(__x86_64__)
+    struct user_regs_struct r {};
+
+    bool load(pid_t pid) {
+        return ::ptrace(PTRACE_GETREGS, pid, nullptr, &r) == 0;
+    }
+    bool store(pid_t pid) {
+        return ::ptrace(PTRACE_SETREGS, pid, nullptr, &r) == 0;
+    }
+    bool cancel_syscall(pid_t pid) {
+        r.orig_rax = static_cast<unsigned long long>(-1);
+        return store(pid);
+    }
+    int64_t sysno() const { return static_cast<int64_t>(r.orig_rax); }
+    uint64_t arg(int idx) const {
+        switch (idx) {
+            case 0: return r.rdi;
+            case 1: return r.rsi;
+            case 2: return r.rdx;
+            case 3: return r.r10;
+            case 4: return r.r8;
+            case 5: return r.r9;
+            default: return 0;
+        }
+    }
+    void set_arg(int idx, uint64_t v) {
+        switch (idx) {
+            case 0: r.rdi = v; break;
+            case 1: r.rsi = v; break;
+            case 2: r.rdx = v; break;
+            case 3: r.r10 = v; break;
+            case 4: r.r8 = v; break;
+            case 5: r.r9 = v; break;
+            default: break;
+        }
+    }
+    int64_t ret() const { return static_cast<int64_t>(r.rax); }
+    void set_ret(int64_t v) { r.rax = static_cast<uint64_t>(v); }
+    uint64_t sp() const { return r.rsp; }
+#endif
+};
+
+// Allocates a safe scratch address below guest SP (past red zone, 16-byte aligned).
+uint64_t scratch_addr_below_sp(uint64_t sp, size_t len) {
+    uint64_t aligned = (len + 15ULL) & ~15ULL;
+    return (sp - 256ULL - aligned) & ~15ULL;
+}
+
+}  // namespace
+
+Supervisor::Supervisor(SupervisorConfig cfg)
+    : cfg_(std::move(cfg)),
+      translator_(cfg_.rootfs_root),
+      pseudo_fs_(cfg_.rootfs_root) {}
+
+bool Supervisor::read_guest_mem(pid_t pid, uint64_t addr, void* out, size_t len) const {
+    if (len == 0) return true;
+    struct iovec local { out, len };
+    struct iovec remote { reinterpret_cast<void*>(addr), len };
+    ssize_t n = ::process_vm_readv(pid, &local, 1, &remote, 1, 0);
+    if (n == static_cast<ssize_t>(len)) return true;
+
+    // Fallback to PTRACE_PEEKDATA when process_vm_readv is restricted
+    auto* dst = reinterpret_cast<uint8_t*>(out);
+    size_t off = 0;
+    while (off < len) {
+        errno = 0;
+        long word = ::ptrace(PTRACE_PEEKDATA, pid, reinterpret_cast<void*>(addr + off), nullptr);
+        if (word == -1 && errno != 0) return false;
+        size_t take = std::min(sizeof(long), len - off);
+        std::memcpy(dst + off, &word, take);
+        off += take;
+    }
+    return true;
+}
+
+bool Supervisor::write_guest_mem(pid_t pid, uint64_t addr, const void* data, size_t len) const {
+    if (len == 0) return true;
+    struct iovec local { const_cast<void*>(data), len };
+    struct iovec remote { reinterpret_cast<void*>(addr), len };
+    ssize_t n = ::process_vm_writev(pid, &local, 1, &remote, 1, 0);
+    if (n == static_cast<ssize_t>(len)) return true;
+
+    // Fallback to PTRACE_POKEDATA
+    const auto* src = reinterpret_cast<const uint8_t*>(data);
+    size_t off = 0;
+    while (off < len) {
+        long word = 0;
+        size_t take = std::min(sizeof(long), len - off);
+        if (take < sizeof(long)) {
+            errno = 0;
+            word = ::ptrace(PTRACE_PEEKDATA, pid, reinterpret_cast<void*>(addr + off), nullptr);
+            if (word == -1 && errno != 0) return false;
+        }
+        std::memcpy(&word, src + off, take);
+        if (::ptrace(PTRACE_POKEDATA, pid, reinterpret_cast<void*>(addr + off),
+                     reinterpret_cast<void*>(word)) != 0) {
+            return false;
+        }
+        off += take;
+    }
+    return true;
+}
+
+bool Supervisor::read_guest_cstring(pid_t pid, uint64_t addr, std::string& out,
+                                    size_t max_len) const {
+    out.clear();
+    if (addr == 0) return false;
+    char chunk[256];
+    while (out.size() < max_len) {
+        size_t want = std::min(sizeof(chunk), max_len - out.size());
+        // Stop at page boundary to avoid reading into unmapped page
+        uint64_t cur = addr + out.size();
+        size_t to_page_end = 4096U - static_cast<size_t>(cur & 4095ULL);
+        want = std::min(want, to_page_end);
+        if (!read_guest_mem(pid, cur, chunk, want)) return !out.empty();
+        for (size_t i = 0; i < want; ++i) {
+            if (chunk[i] == '\0') return true;
+            out.push_back(chunk[i]);
+        }
+    }
+    return true;
+}
+
+std::string Supervisor::read_elf_interp(const std::string& host_binary_path) {
+    std::ifstream f(host_binary_path, std::ios::binary);
+    if (!f.is_open()) return "";
+    Elf64_Ehdr ehdr {};
+    f.read(reinterpret_cast<char*>(&ehdr), sizeof(ehdr));
+    if (!f || std::memcmp(ehdr.e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr.e_ident[EI_CLASS] != ELFCLASS64) {
+        return "";
+    }
+    f.seekg(static_cast<std::streamoff>(ehdr.e_phoff), std::ios::beg);
+    for (uint16_t i = 0; i < ehdr.e_phnum; ++i) {
+        Elf64_Phdr phdr {};
+        f.read(reinterpret_cast<char*>(&phdr), sizeof(phdr));
+        if (!f) break;
+        if (phdr.p_type == PT_INTERP && phdr.p_filesz > 0 && phdr.p_filesz < 512) {
+            std::string interp(static_cast<size_t>(phdr.p_filesz), '\0');
+            f.seekg(static_cast<std::streamoff>(phdr.p_offset), std::ios::beg);
+            f.read(interp.data(), static_cast<std::streamsize>(phdr.p_filesz));
+            while (!interp.empty() && interp.back() == '\0') interp.pop_back();
+            return interp;
+        }
+    }
+    return "";
+}
+
+int Supervisor::run(const std::vector<std::string>& guest_argv,
+                    const std::vector<std::string>& guest_env) {
+    if (guest_argv.empty()) return 1;
+
+    // 1. Configure sub-reaper so double-forked guest daemons never leak to host init
+    ::prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+
+    // 2. Load VfsMetaDb if provided
+    if (!cfg_.meta_db_path.empty()) {
+        if (!meta_db_.open(cfg_.meta_db_path.c_str())) {
+            std::fprintf(stderr, "[guest_runner] warning: failed to open %s\n",
+                         cfg_.meta_db_path.c_str());
+        } else if (cfg_.verbose) {
+            std::fprintf(stderr, "[guest_runner] loaded VfsMetaDb (%u entries)\n",
+                         meta_db_.count());
+        }
+    }
+
+    // 3. Select transport (Kernel 4.19.x automatically uses SECCOMP_RET_TRACE)
+    InterceptionTransport active = select_transport(cfg_.transport);
+    // In Phase 2, full path-pointer rewriting (openat/stat/execve/getcwd) requires ptrace
+    // on kernels without SECCOMP_IOCTL_NOTIF_ADDFD. Default kAuto to kPtraceTrace for
+    // deterministic full-VFS emulation across both 4.19.x and 5.x kernels unless explicitly
+    // requesting kUserNotif mode.
+    if (cfg_.transport == InterceptionTransport::kAuto) {
+        active = InterceptionTransport::kPtraceTrace;
+    }
+
+    if (cfg_.verbose) {
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s\n",
+                     active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
+                                                                 : "SECCOMP_RET_TRACE+ptrace",
+                     cfg_.rootfs_root.c_str());
+    }
+
+    // Resolve initial executable & check PT_INTERP so guest's own linker64 is used
+    TranslatedPath entry_bin = translator_.translate_absolute(guest_argv[0], true);
+    std::string interp_guest = read_elf_interp(entry_bin.host_path);
+
+    std::vector<std::string> exec_args;
+    std::string host_exec_target = entry_bin.host_path;
+    if (!interp_guest.empty()) {
+        TranslatedPath interp_tp = translator_.translate_absolute(interp_guest, true);
+        if (::access(interp_tp.host_path.c_str(), X_OK) == 0) {
+            // Invoke guest's own linker64 directly: linker64 <host_bin> [guest_args...]
+            host_exec_target = interp_tp.host_path;
+            exec_args.push_back(interp_tp.host_path);
+            exec_args.push_back(entry_bin.host_path);
+            for (size_t i = 1; i < guest_argv.size(); ++i) {
+                exec_args.push_back(guest_argv[i]);
+            }
+        }
+    }
+    if (exec_args.empty()) {
+        exec_args.push_back(entry_bin.host_path);
+        for (size_t i = 1; i < guest_argv.size(); ++i) {
+            exec_args.push_back(guest_argv[i]);
+        }
+    }
+
+    int sockpair[2] = {-1, -1};
+    if (active == InterceptionTransport::kUserNotif) {
+        if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockpair) != 0) {
+            return 1;
+        }
+    }
+
+    pid_t child = ::fork();
+    if (child < 0) return 1;
+
+    if (child == 0) {
+        ::prctl(PR_SET_PDEATHSIG, SIGKILL);
+        if (::chdir(cfg_.rootfs_root.c_str()) != 0) {
+            _exit(126);
+        }
+
+        if (active == InterceptionTransport::kPtraceTrace) {
+            if (::ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) != 0) _exit(126);
+            ::raise(SIGSTOP);  // Synchronize with supervisor PTRACE_SETOPTIONS
+            auto prog = build_seccomp_filter(SECCOMP_RET_TRACE);
+            if (install_seccomp_filter(prog, false) != 0) _exit(126);
+        } else {
+            ::close(sockpair[0]);
+            auto prog = build_seccomp_filter(SECCOMP_RET_USER_NOTIF);
+            int lfd = install_seccomp_filter(prog, true);
+            if (lfd < 0) _exit(126);
+            // Pass listener_fd to supervisor via SCM_RIGHTS
+            char dummy = 'L';
+            struct iovec iov { &dummy, 1 };
+            union {
+                char buf[CMSG_SPACE(sizeof(int))];
+                struct cmsghdr align;
+            } cmsg_u {};
+            struct msghdr msg {};
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = cmsg_u.buf;
+            msg.msg_controllen = sizeof(cmsg_u.buf);
+            struct cmsghdr* cm = CMSG_FIRSTHDR(&msg);
+            cm->cmsg_level = SOL_SOCKET;
+            cm->cmsg_type = SCM_RIGHTS;
+            cm->cmsg_len = CMSG_LEN(sizeof(int));
+            std::memcpy(CMSG_DATA(cm), &lfd, sizeof(int));
+            ::sendmsg(sockpair[1], &msg, 0);
+            ::close(lfd);
+            ::close(sockpair[1]);
+        }
+
+        std::vector<char*> c_argv;
+        c_argv.reserve(exec_args.size() + 1);
+        for (auto& s : exec_args) c_argv.push_back(s.data());
+        c_argv.push_back(nullptr);
+
+        std::vector<char*> c_env;
+        for (auto& e : const_cast<std::vector<std::string>&>(guest_env)) {
+            c_env.push_back(e.data());
+        }
+        c_env.push_back(nullptr);
+
+        ::execve(host_exec_target.c_str(), c_argv.data(),
+                 guest_env.empty() ? environ : c_env.data());
+        _exit(127);
+    }
+
+    if (active == InterceptionTransport::kUserNotif) {
+        ::close(sockpair[1]);
+        char dummy = 0;
+        struct iovec iov { &dummy, 1 };
+        union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } cmsg_u {};
+        struct msghdr msg {};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_u.buf;
+        msg.msg_controllen = sizeof(cmsg_u.buf);
+        int listener_fd = -1;
+        if (::recvmsg(sockpair[0], &msg, 0) > 0) {
+            struct cmsghdr* cm = CMSG_FIRSTHDR(&msg);
+            if (cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS) {
+                std::memcpy(&listener_fd, CMSG_DATA(cm), sizeof(int));
+            }
+        }
+        ::close(sockpair[0]);
+        return run_user_notif_loop(child, listener_fd);
+    }
+
+    return run_ptrace_loop(child);
+}
+
+int Supervisor::run_ptrace_loop(pid_t root_child) {
+    int status = 0;
+    if (::waitpid(root_child, &status, 0) < 0) return 1;
+
+    unsigned long opts = PTRACE_O_TRACESECCOMP | PTRACE_O_TRACECLONE |
+                         PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
+                         PTRACE_O_TRACEEXEC | PTRACE_O_EXITKILL | PTRACE_O_TRACESYSGOOD;
+    if (::ptrace(PTRACE_SETOPTIONS, root_child, nullptr, reinterpret_cast<void*>(opts)) != 0) {
+        return 1;
+    }
+
+    registry_.get_or_create(root_child, cfg_.initial_creds);
+    ::ptrace(PTRACE_CONT, root_child, nullptr, nullptr);
+
+    int root_exit_code = 0;
+
+    while (!registry_.empty()) {
+        pid_t pid = ::waitpid(-1, &status, __WALL);
+        if (pid < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        if (WIFEXITED(status)) {
+            if (pid == root_child) root_exit_code = WEXITSTATUS(status);
+            registry_.erase(pid);
+            continue;
+        }
+        if (WIFSIGNALED(status)) {
+            if (pid == root_child) root_exit_code = 128 + WTERMSIG(status);
+            registry_.erase(pid);
+            continue;
+        }
+        if (!WIFSTOPPED(status)) continue;
+
+        const int sig = WSTOPSIG(status);
+        const int event = (status >> 16) & 0xFFFF;
+        ProcessState& proc = registry_.get_or_create(pid, cfg_.initial_creds);
+
+        if (sig == SIGTRAP && event == PTRACE_EVENT_SECCOMP) {
+            handle_ptrace_seccomp_entry(pid, proc);
+            if (proc.expecting_syscall_exit) {
+                ::ptrace(PTRACE_SYSCALL, pid, nullptr, nullptr);
+            } else {
+                ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+            }
+        } else if (sig == (SIGTRAP | 0x80) && proc.expecting_syscall_exit) {
+            proc.expecting_syscall_exit = false;
+            handle_ptrace_syscall_exit(pid, proc);
+            ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+        } else if (sig == SIGTRAP &&
+                   (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK ||
+                    event == PTRACE_EVENT_CLONE)) {
+            unsigned long new_pid = 0;
+            if (::ptrace(PTRACE_GETEVENTMSG, pid, nullptr, &new_pid) == 0 && new_pid > 0) {
+                registry_.inherit_from_parent(pid, static_cast<pid_t>(new_pid));
+            }
+            ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+        } else if (sig == SIGTRAP && event == PTRACE_EVENT_EXEC) {
+            proc.expecting_syscall_exit = false;
+            proc.exit_op = PendingExitOp{};
+            ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+        } else {
+            int deliver_sig = (sig == SIGTRAP || sig == SIGSTOP) ? 0 : sig;
+            ::ptrace(PTRACE_CONT, pid, nullptr,
+                     reinterpret_cast<void*>(static_cast<uintptr_t>(deliver_sig)));
+        }
+    }
+
+    return root_exit_code;
+}
+
+void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
+    ArchRegs regs;
+    if (!regs.load(pid)) return;
+    const int64_t nr = regs.sysno();
+
+    auto skip_with_ret = [&](int64_t retval) {
+        regs.cancel_syscall(pid);
+        regs.set_ret(retval);
+        regs.store(pid);
+    };
+
+    // --- 1. Virtual Credential Getters ---
+    if (nr == SYS_getuid)  { skip_with_ret(proc.creds.uid); return; }
+    if (nr == SYS_geteuid) { skip_with_ret(proc.creds.euid); return; }
+    if (nr == SYS_getgid)  { skip_with_ret(proc.creds.gid); return; }
+    if (nr == SYS_getegid) { skip_with_ret(proc.creds.egid); return; }
+    if (nr == SYS_getresuid) {
+        write_guest_mem(pid, regs.arg(0), &proc.creds.uid, sizeof(uint32_t));
+        write_guest_mem(pid, regs.arg(1), &proc.creds.euid, sizeof(uint32_t));
+        write_guest_mem(pid, regs.arg(2), &proc.creds.suid, sizeof(uint32_t));
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_getresgid) {
+        write_guest_mem(pid, regs.arg(0), &proc.creds.gid, sizeof(uint32_t));
+        write_guest_mem(pid, regs.arg(1), &proc.creds.egid, sizeof(uint32_t));
+        write_guest_mem(pid, regs.arg(2), &proc.creds.sgid, sizeof(uint32_t));
+        skip_with_ret(0);
+        return;
+    }
+
+    // --- 2. Virtual Credential Setters & Mount / Cap / Ownership Spoofing ---
+    if (nr == SYS_setuid) {
+        uint32_t v = static_cast<uint32_t>(regs.arg(0));
+        proc.creds.uid = proc.creds.euid = proc.creds.suid = v;
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_setgid) {
+        uint32_t v = static_cast<uint32_t>(regs.arg(0));
+        proc.creds.gid = proc.creds.egid = proc.creds.sgid = v;
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_setresuid) {
+        uint32_t r = static_cast<uint32_t>(regs.arg(0));
+        uint32_t e = static_cast<uint32_t>(regs.arg(1));
+        uint32_t s = static_cast<uint32_t>(regs.arg(2));
+        if (r != static_cast<uint32_t>(-1)) proc.creds.uid = r;
+        if (e != static_cast<uint32_t>(-1)) proc.creds.euid = e;
+        if (s != static_cast<uint32_t>(-1)) proc.creds.suid = s;
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_setresgid) {
+        uint32_t r = static_cast<uint32_t>(regs.arg(0));
+        uint32_t e = static_cast<uint32_t>(regs.arg(1));
+        uint32_t s = static_cast<uint32_t>(regs.arg(2));
+        if (r != static_cast<uint32_t>(-1)) proc.creds.gid = r;
+        if (e != static_cast<uint32_t>(-1)) proc.creds.egid = e;
+        if (s != static_cast<uint32_t>(-1)) proc.creds.sgid = s;
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_setgroups || nr == SYS_capset || nr == SYS_fchownat || nr == SYS_fchown ||
+        nr == SYS_mount || nr == SYS_umount2 || nr == SYS_chroot || nr == SYS_pivot_root ||
+        nr == SYS_sethostname || nr == SYS_setdomainname || nr == SYS_unshare) {
+        skip_with_ret(0);
+        return;
+    }
+
+    // --- 3. getcwd: intercept exit to strip host rootfs prefix ---
+    if (nr == SYS_getcwd) {
+        proc.expecting_syscall_exit = true;
+        proc.exit_op = PendingExitOp{ExitPatchKind::kStripRootfsGetcwd, -1, 0,
+                                     regs.arg(0), regs.arg(1), ""};
+        return;
+    }
+
+    // --- 4. Path-Based Syscall Redirection ---
+    auto rewrite_path_arg = [&](int dirfd_arg_idx, int path_arg_idx, bool follow_final,
+                                ExitPatchKind exit_kind, uint64_t out_buf, uint64_t out_len) {
+        std::string raw_path;
+        if (!read_guest_cstring(pid, regs.arg(path_arg_idx), raw_path)) return;
+        int dirfd = (dirfd_arg_idx >= 0) ? static_cast<int>(regs.arg(dirfd_arg_idx)) : AT_FDCWD;
+
+        TranslatedPath tp = translator_.translate(pid, dirfd, raw_path, follow_final);
+        if (tp.kind == PathKind::kHostPassThru) return;
+
+        // Write translated host path into guest scratch area below SP
+        std::string with_nul = tp.host_path;
+        with_nul.push_back('\0');
+        uint64_t scratch = scratch_addr_below_sp(regs.sp(), with_nul.size());
+        if (!write_guest_mem(pid, scratch, with_nul.data(), with_nul.size())) return;
+
+        uint64_t orig_ptr = regs.arg(path_arg_idx);
+        regs.set_arg(path_arg_idx, scratch);
+        regs.store(pid);
+
+        proc.expecting_syscall_exit = true;
+        proc.exit_op = PendingExitOp{exit_kind, path_arg_idx, orig_ptr,
+                                     out_buf, out_len, tp.guest_path};
+    };
+
+    if (nr == SYS_openat) {
+        rewrite_path_arg(0, 1, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
+        return;
+    }
+    if (nr == SYS_newfstatat) {
+        bool follow = (regs.arg(3) & AT_SYMLINK_NOFOLLOW) == 0;
+        rewrite_path_arg(0, 1, follow, ExitPatchKind::kPatchStatBuf, regs.arg(2), sizeof(struct stat));
+        return;
+    }
+#ifdef SYS_statx
+    if (nr == SYS_statx) {
+        bool follow = (regs.arg(2) & AT_SYMLINK_NOFOLLOW) == 0;
+        rewrite_path_arg(0, 1, follow, ExitPatchKind::kPatchStatxBuf, regs.arg(4), 256);
+        return;
+    }
+#endif
+    if (nr == SYS_faccessat
+#ifdef SYS_faccessat2
+        || nr == SYS_faccessat2
+#endif
+    ) {
+        rewrite_path_arg(0, 1, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
+        return;
+    }
+    if (nr == SYS_readlinkat) {
+        rewrite_path_arg(0, 1, false, ExitPatchKind::kStripRootfsReadlink, regs.arg(2), regs.arg(3));
+        return;
+    }
+    if (nr == SYS_unlinkat || nr == SYS_mkdirat || nr == SYS_fchmodat || nr == SYS_utimensat) {
+        rewrite_path_arg(0, 1, false, ExitPatchKind::kRestoreRegOnly, 0, 0);
+        return;
+    }
+    if (nr == SYS_chdir || nr == SYS_truncate || nr == SYS_execve) {
+        rewrite_path_arg(-1, 0, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
+        return;
+    }
+}
+
+void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
+    PendingExitOp op = std::move(proc.exit_op);
+    proc.exit_op = PendingExitOp{};
+
+    ArchRegs regs;
+    if (!regs.load(pid)) return;
+
+    if (op.saved_reg_index >= 0) {
+        regs.set_arg(op.saved_reg_index, op.saved_reg_val);
+        regs.store(pid);
+    }
+
+    if (regs.ret() < 0) return;
+
+    if (op.kind == ExitPatchKind::kPatchStatBuf && op.out_buf_addr != 0) {
+        auto meta = meta_db_.find(op.guest_path);
+        if (meta.has_value()) {
+            struct stat st {};
+            if (read_guest_mem(pid, op.out_buf_addr, &st, sizeof(st))) {
+                st.st_uid = meta->entry->uid;
+                st.st_gid = meta->entry->gid;
+                st.st_mode = (st.st_mode & S_IFMT) | (meta->entry->mode & 07777);
+                write_guest_mem(pid, op.out_buf_addr, &st, sizeof(st));
+            }
+        }
+    } else if (op.kind == ExitPatchKind::kStripRootfsGetcwd && op.out_buf_addr != 0) {
+        std::string host_cwd;
+        if (read_guest_cstring(pid, op.out_buf_addr, host_cwd, op.out_buf_len)) {
+            std::string guest_cwd = translator_.host_to_guest(host_cwd);
+            if (guest_cwd.size() + 1 <= op.out_buf_len) {
+                write_guest_mem(pid, op.out_buf_addr, guest_cwd.c_str(), guest_cwd.size() + 1);
+                regs.set_ret(static_cast<int64_t>(guest_cwd.size() + 1));
+                regs.store(pid);
+            }
+        }
+    } else if (op.kind == ExitPatchKind::kStripRootfsReadlink && op.out_buf_addr != 0) {
+        size_t n = static_cast<size_t>(regs.ret());
+        if (n > 0 && n <= op.out_buf_len) {
+            std::string val(n, '\0');
+            if (read_guest_mem(pid, op.out_buf_addr, val.data(), n)) {
+                std::string stripped = translator_.host_to_guest(val);
+                if (stripped != val && stripped.size() <= op.out_buf_len) {
+                    write_guest_mem(pid, op.out_buf_addr, stripped.data(), stripped.size());
+                    regs.set_ret(static_cast<int64_t>(stripped.size()));
+                    regs.store(pid);
+                }
+            }
+        }
+    }
+}
+
+int Supervisor::run_user_notif_loop(pid_t root_child, int listener_fd) {
+    if (listener_fd < 0) return 1;
+    registry_.get_or_create(root_child, cfg_.initial_creds);
+
+    struct seccomp_notif req {};
+    struct seccomp_notif_resp resp {};
+
+    while (true) {
+        std::memset(&req, 0, sizeof(req));
+        if (::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_RECV, &req) != 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+
+        std::memset(&resp, 0, sizeof(resp));
+        resp.id = req.id;
+
+        // Validate notification cookie before touching guest state (TOCTOU defense)
+        uint64_t id_check = req.id;
+        if (::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_ID_VALID, &id_check) != 0) {
+            continue;
+        }
+
+        ProcessState& proc = registry_.get_or_create(static_cast<pid_t>(req.pid),
+                                                     cfg_.initial_creds);
+        const int nr = req.data.nr;
+
+        if (nr == SYS_getuid)       { resp.val = proc.creds.uid; }
+        else if (nr == SYS_geteuid) { resp.val = proc.creds.euid; }
+        else if (nr == SYS_getgid)  { resp.val = proc.creds.gid; }
+        else if (nr == SYS_getegid) { resp.val = proc.creds.egid; }
+        else if (nr == SYS_setuid)  {
+            proc.creds.uid = proc.creds.euid = proc.creds.suid =
+                static_cast<uint32_t>(req.data.args[0]);
+            resp.val = 0;
+        } else if (nr == SYS_setgid) {
+            proc.creds.gid = proc.creds.egid = proc.creds.sgid =
+                static_cast<uint32_t>(req.data.args[0]);
+            resp.val = 0;
+        } else if (nr == SYS_mount || nr == SYS_umount2 || nr == SYS_chroot ||
+                   nr == SYS_capset || nr == SYS_setgroups) {
+            resp.val = 0;
+        } else {
+            resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+        }
+
+        ::ioctl(listener_fd, SECCOMP_IOCTL_NOTIF_SEND, &resp);
+    }
+
+    ::close(listener_fd);
+    int status = 0;
+    ::waitpid(root_child, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+
+}  // namespace vguest
