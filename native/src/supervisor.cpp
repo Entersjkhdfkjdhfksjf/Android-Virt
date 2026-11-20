@@ -758,6 +758,14 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         return;
     }
 
+    // --- 3b. getsockname/getpeername: strip host rootfs prefix from AF_UNIX sun_path ---
+    if (nr == SYS_getsockname || nr == SYS_getpeername) {
+        proc.expecting_syscall_exit = true;
+        proc.exit_op = PendingExitOp{ExitPatchKind::kStripRootfsSockaddr,
+                                     -1, 0, -1, 0, regs.arg(1), regs.arg(2), "", 0, ""};
+        return;
+    }
+
     // --- 4. getcwd: intercept exit to strip host rootfs prefix ---
     if (nr == SYS_getcwd) {
         proc.expecting_syscall_exit = true;
@@ -1055,6 +1063,28 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
                 write_guest_mem(pid, op.out_buf_addr, guest_cwd.c_str(), guest_cwd.size() + 1);
                 regs.set_ret(static_cast<int64_t>(guest_cwd.size() + 1));
                 regs.store(pid);
+            }
+        }
+    } else if (op.kind == ExitPatchKind::kStripRootfsSockaddr && op.out_buf_addr != 0 && op.out_buf_len != 0) {
+        socklen_t slen = 0;
+        if (read_guest_mem(pid, op.out_buf_len, &slen, sizeof(slen)) &&
+            slen > offsetof(struct sockaddr_un, sun_path) &&
+            slen <= sizeof(struct sockaddr_un)) {
+            struct sockaddr_un sa {};
+            if (read_guest_mem(pid, op.out_buf_addr, &sa, slen) && sa.sun_family == AF_UNIX) {
+                size_t pbytes = slen - offsetof(struct sockaddr_un, sun_path);
+                if (pbytes > 0 && sa.sun_path[0] != '\0') {
+                    size_t n = ::strnlen(sa.sun_path, pbytes);
+                    std::string stripped = translator_.host_to_guest(std::string_view(sa.sun_path, n));
+                    if (stripped.size() < sizeof(sa.sun_path)) {
+                        std::memset(sa.sun_path, 0, sizeof(sa.sun_path));
+                        std::memcpy(sa.sun_path, stripped.data(), stripped.size());
+                        socklen_t new_len = static_cast<socklen_t>(
+                            offsetof(struct sockaddr_un, sun_path) + stripped.size() + 1);
+                        write_guest_mem(pid, op.out_buf_addr, &sa, new_len);
+                        write_guest_mem(pid, op.out_buf_len, &new_len, sizeof(new_len));
+                    }
+                }
             }
         }
     } else if (op.kind == ExitPatchKind::kStripRootfsReadlink && op.out_buf_addr != 0) {

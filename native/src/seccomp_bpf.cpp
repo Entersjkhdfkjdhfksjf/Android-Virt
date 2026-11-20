@@ -90,6 +90,8 @@ std::vector<uint32_t> intercepted_syscalls() {
         // Sockets & Binder epoll
         SYS_bind,
         SYS_connect,
+        SYS_getsockname,
+        SYS_getpeername,
         SYS_epoll_ctl,
         SYS_epoll_pwait,
     };
