@@ -46,7 +46,7 @@ inline size_t compute_ring_total_size(uint32_t width, uint32_t height) noexcept 
 }
 
 inline void init_fb_header(VirtFbHeader* hdr, uint32_t width, uint32_t height) noexcept {
-    std::memset(hdr, 0, kFbHeaderSize);
+    std::memset(static_cast<void*>(hdr), 0, kFbHeaderSize);
     std::memcpy(hdr->magic, kFbMagic, 4);
     hdr->version = kFbVersion;
     hdr->width = width;

@@ -61,6 +61,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binderTestBtn: Button
     private lateinit var displayTestBtn: Button
     private lateinit var stopBtn: Button
+    private lateinit var bootIpcBtn: Button
+    private lateinit var bootArtBtn: Button
+    private lateinit var bootFullBtn: Button
     private lateinit var runBtn: Button
 
     private val rootfsDir: File get() = File(filesDir, "rootfs")
@@ -85,7 +88,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         val title = TextView(this).apply {
-            text = "VGuest AOSP 12 — Phase 5 Display & Input Console"
+            text = "VGuest AOSP 12 — Phase 6 Runtime Bring-Up Console"
             setTextColor(Color.parseColor("#E6EDF3"))
             textSize = 19f
             setTypeface(Typeface.SANS_SERIF, Typeface.BOLD)
@@ -137,6 +140,27 @@ class MainActivity : AppCompatActivity() {
         btnRow.addView(stopBtn)
         btnRow.addView(clearBtn)
         root.addView(btnRow)
+
+        val p6Row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        bootIpcBtn = Button(this).apply {
+            text = "P6: 3-Binder IPC"
+            setOnClickListener { runBootStage("ipc") }
+        }
+        bootArtBtn = Button(this).apply {
+            text = "P6: ART VM"
+            setOnClickListener { runBootStage("art") }
+        }
+        bootFullBtn = Button(this).apply {
+            text = "P6: Boot Zygote"
+            setOnClickListener { runBootStage("full") }
+        }
+        p6Row.addView(bootIpcBtn)
+        p6Row.addView(bootArtBtn)
+        p6Row.addView(bootFullBtn)
+        root.addView(p6Row)
 
         // Live hardware-accelerated SurfaceView for guest display (shown during Phase 5+)
         displayContainer = LinearLayout(this).apply {
@@ -280,6 +304,9 @@ class MainActivity : AppCompatActivity() {
             binderTestBtn.isEnabled = !busy
             displayTestBtn.isEnabled = !busy
             runBtn.isEnabled = !busy
+            bootIpcBtn.isEnabled = !busy
+            bootArtBtn.isEnabled = !busy
+            bootFullBtn.isEnabled = !busy
             stopBtn.isEnabled = busy
         }
     }
@@ -357,6 +384,43 @@ class MainActivity : AppCompatActivity() {
         }
         appendLog("[display] Draw on the canvas! Finger = Green, S Pen = Orange (pressure-sensitive). Tap Stop to exit.")
         runGuestShell("/vendor/bin/vguest_fb_demo", showDisplay = true)
+    }
+
+    private fun runBootStage(stage: String) {
+        if (!runnerBin.exists() || !File(rootfsDir, "system/bin/sh").exists()) {
+            appendLog("[ERROR] Rootfs or runner missing.")
+            return
+        }
+        setBusy(true)
+        runOnUiThread { displayContainer.visibility = View.GONE }
+        appendLog("\n=== Launching Phase 6 Boot Stage: $stage ===")
+        executor.execute {
+            try {
+                val args = listOf(
+                    runnerBin.absolutePath,
+                    "--rootfs", rootfsDir.absolutePath,
+                    "--meta-db", metaDbFile.absolutePath,
+                    "--boot", stage,
+                    "--verbose"
+                )
+                val proc = ProcessBuilder(args).redirectErrorStream(true).start()
+                activeProcess = proc
+                BufferedReader(InputStreamReader(proc.inputStream)).use { reader ->
+                    var line: String? = reader.readLine()
+                    while (line != null) {
+                        appendLog(line)
+                        line = reader.readLine()
+                    }
+                }
+                val rc = proc.waitFor()
+                appendLog("=== Boot stage '$stage' exited with code $rc ===")
+            } catch (t: Throwable) {
+                appendLog("[ERROR] Boot failed: ${t.javaClass.simpleName}: ${t.message}")
+            } finally {
+                activeProcess = null
+                setBusy(false)
+            }
+        }
     }
 
     private fun runGuestShell(shellCmd: String, showDisplay: Boolean) {
