@@ -816,6 +816,36 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         rewrite_path_arg(0, 1, false, ExitPatchKind::kRestoreRegOnly, 0, 0);
         return;
     }
+    if (false
+#ifdef SYS_renameat
+        || nr == SYS_renameat
+#endif
+#ifdef SYS_renameat2
+        || nr == SYS_renameat2
+#endif
+    ) {
+        std::string raw_old, raw_new;
+        if (!read_guest_cstring(pid, regs.arg(1), raw_old) ||
+            !read_guest_cstring(pid, regs.arg(3), raw_new)) return;
+        TranslatedPath tp_old = translator_.translate(pid, static_cast<int>(regs.arg(0)), raw_old, false);
+        TranslatedPath tp_new = translator_.translate(pid, static_cast<int>(regs.arg(2)), raw_new, false);
+        std::string s_old = tp_old.host_path; s_old.push_back('\0');
+        std::string s_new = tp_new.host_path; s_new.push_back('\0');
+        size_t total = s_old.size() + s_new.size();
+        uint64_t scratch = scratch_addr_below_sp(regs.sp(), total);
+        std::vector<uint8_t> blob(total);
+        std::memcpy(blob.data(), s_old.data(), s_old.size());
+        std::memcpy(blob.data() + s_old.size(), s_new.data(), s_new.size());
+        if (!write_guest_mem(pid, scratch, blob.data(), blob.size())) return;
+        uint64_t orig1 = regs.arg(1), orig3 = regs.arg(3);
+        regs.set_arg(1, scratch);
+        regs.set_arg(3, scratch + s_old.size());
+        regs.store(pid);
+        proc.expecting_syscall_exit = true;
+        proc.exit_op = PendingExitOp{ExitPatchKind::kRestoreRegOnly,
+                                     1, orig1, 3, orig3, 0, 0, tp_new.guest_path, 0, ""};
+        return;
+    }
     if (nr == SYS_chdir || nr == SYS_truncate) {
         rewrite_path_arg(-1, 0, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
         return;

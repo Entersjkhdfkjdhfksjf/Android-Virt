@@ -242,6 +242,51 @@ bool BootSequencer::provision_vintf_manifest() const {
 </manifest>
 )XML";
 
+    // Ensure /linkerconfig/ld.config.txt exports a visible `system` namespace for libart OAT loading
+    {
+        std::string ld_path = rootfs_root_ + "/linkerconfig/ld.config.txt";
+        std::ifstream lin(ld_path);
+        if (lin.is_open()) {
+            std::ostringstream ss;
+            ss << lin.rdbuf();
+            std::string content = ss.str();
+            lin.close();
+            if (content.find("namespace.system.visible = true") == std::string::npos) {
+                // Inject `system` into additional.namespaces and append namespace.system block under [system]
+                size_t pos = content.find("additional.namespaces = ");
+                if (pos != std::string::npos) {
+                    size_t val_pos = pos + 24;
+                    if (content.compare(val_pos, 7, "system,") != 0) {
+                        content.insert(val_pos, "system,");
+                    }
+                }
+                size_t links_pos = content.find("namespace.default.links = ");
+                if (links_pos != std::string::npos) {
+                    size_t val_pos = links_pos + 26;
+                    if (content.compare(val_pos, 7, "system,") != 0) {
+                        content.insert(val_pos, "system,");
+                    }
+                }
+                size_t vend_pos = content.find("\n[vendor]");
+                std::string sys_ns =
+                    "\nnamespace.default.link.system.allow_all_shared_libs = true\n"
+                    "\nnamespace.system.isolated = false\n"
+                    "namespace.system.visible = true\n"
+                    "namespace.system.search.paths = /system/lib64:/system_ext/lib64:/product/lib64:/vendor/lib64:/apex/com.android.art/lib64:/apex/com.android.runtime/lib64:/apex/com.android.runtime/lib64/bionic:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64\n"
+                    "namespace.system.permitted.paths = /system:/system_ext:/product:/vendor:/apex:/data\n"
+                    "namespace.system.links = default\n"
+                    "namespace.system.link.default.allow_all_shared_libs = true\n";
+                if (vend_pos != std::string::npos) {
+                    content.insert(vend_pos, sys_ns);
+                } else {
+                    content.append(sys_ns);
+                }
+                std::ofstream lout(ld_path, std::ios::trunc);
+                lout << content;
+            }
+        }
+    }
+
     std::ofstream out(rootfs_root_ + "/vendor/etc/vintf/manifest.xml", std::ios::trunc);
     if (!out.is_open()) return false;
     out << kManifestXml;
