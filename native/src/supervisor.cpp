@@ -776,8 +776,88 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         rewrite_path_arg(0, 1, false, ExitPatchKind::kRestoreRegOnly, 0, 0);
         return;
     }
-    if (nr == SYS_chdir || nr == SYS_truncate || nr == SYS_execve) {
+    if (nr == SYS_chdir || nr == SYS_truncate) {
         rewrite_path_arg(-1, 0, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
+        return;
+    }
+    if (nr == SYS_execve) {
+        std::string raw_path;
+        if (!read_guest_cstring(pid, regs.arg(0), raw_path)) return;
+        TranslatedPath tp = translator_.translate(pid, AT_FDCWD, raw_path, true);
+        if (tp.kind == PathKind::kHostPassThru) return;
+
+        // Inspect ELF64 PT_INTERP so child execve ALWAYS uses guest AOSP 12 linker64,
+        // NEVER host Android 13 One UI /system/bin/linker64!
+        std::string interp_guest = read_elf_interp(tp.host_path);
+        TranslatedPath interp_tp;
+        bool use_guest_linker = false;
+        if (!interp_guest.empty()) {
+            interp_tp = translator_.translate_absolute(interp_guest, true);
+            if (interp_tp.host_path != tp.host_path &&
+                ::access(interp_tp.host_path.c_str(), X_OK) == 0) {
+                use_guest_linker = true;
+            }
+        }
+
+        if (!use_guest_linker) {
+            rewrite_path_arg(-1, 0, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
+            return;
+        }
+
+        // Read original argv[] pointers from guest memory
+        std::vector<uint64_t> orig_argv;
+        uint64_t argv_ptr = regs.arg(1);
+        if (argv_ptr != 0) {
+            for (size_t idx = 0; idx < 128; ++idx) {
+                uint64_t p = 0;
+                if (!read_guest_mem(pid, argv_ptr + idx * sizeof(uint64_t), &p, sizeof(p))) break;
+                if (p == 0) break;
+                orig_argv.push_back(p);
+            }
+        }
+
+        // Build scratch block below guest SP:
+        //   [linker_path ][target_bin_path ][8-byte aligned new_argv ptr array]
+        std::string s_linker = interp_tp.host_path;
+        s_linker.push_back(' ');
+        std::string s_bin = tp.host_path;
+        s_bin.push_back(' ');
+
+        size_t str_bytes = (s_linker.size() + s_bin.size() + 15u) & ~15u;
+        size_t new_argc = 2 + (orig_argv.size() > 1 ? (orig_argv.size() - 1) : 0);
+        size_t ptr_bytes = (new_argc + 1) * sizeof(uint64_t);
+        size_t total_scratch = str_bytes + ptr_bytes;
+
+        uint64_t scratch_base = scratch_addr_below_sp(regs.sp(), total_scratch);
+        uint64_t addr_linker = scratch_base;
+        uint64_t addr_bin = scratch_base + s_linker.size();
+        uint64_t addr_argv = scratch_base + str_bytes;
+
+        std::vector<uint64_t> new_argv;
+        new_argv.reserve(new_argc + 1);
+        new_argv.push_back(addr_linker);
+        new_argv.push_back(addr_bin);
+        for (size_t idx = 1; idx < orig_argv.size(); ++idx) {
+            new_argv.push_back(orig_argv[idx]);
+        }
+        new_argv.push_back(0);
+
+        std::vector<uint8_t> blob(total_scratch, 0);
+        std::memcpy(blob.data(), s_linker.data(), s_linker.size());
+        std::memcpy(blob.data() + s_linker.size(), s_bin.data(), s_bin.size());
+        std::memcpy(blob.data() + str_bytes, new_argv.data(), ptr_bytes);
+
+        if (!write_guest_mem(pid, scratch_base, blob.data(), blob.size())) return;
+
+        uint64_t orig_arg0 = regs.arg(0);
+        uint64_t orig_arg1 = regs.arg(1);
+        regs.set_arg(0, addr_linker);
+        regs.set_arg(1, addr_argv);
+        regs.store(pid);
+
+        proc.expecting_syscall_exit = true;
+        proc.exit_op = PendingExitOp{ExitPatchKind::kRestoreRegOnly,
+                                     0, orig_arg0, 1, orig_arg1, 0, 0, tp.guest_path, 0, ""};
         return;
     }
 }
