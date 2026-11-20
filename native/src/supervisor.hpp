@@ -36,7 +36,7 @@ private:
 
     void handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc);
     void handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc);
-    void wake_parked_binder_threads(const std::vector<pid_t>& pids);
+    void wake_parked_binder_threads(const std::vector<WakeEvent>& wakes);
 
     bool read_guest_mem(pid_t pid, uint64_t addr, void* out, size_t len) const;
     bool write_guest_mem(pid_t pid, uint64_t addr, const void* data, size_t len) const;

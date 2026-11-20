@@ -4,6 +4,7 @@
 #include <deque>
 #include <functional>
 #include <string>
+#include <sys/epoll.h>
 #include <sys/types.h>
 #include <unordered_map>
 #include <vector>
@@ -18,19 +19,24 @@ enum class BinderDomain : uint8_t {
     kVndBinder = 2,  // /dev/vndbinder
 };
 
-// Memory-access callbacks supplied by Supervisor (or unit-test mock).
 struct GuestMemOps {
     std::function<bool(pid_t, uint64_t, void*, size_t)> read;
     std::function<bool(pid_t, uint64_t, const void*, size_t)> write;
-    // Discovers the guest's virtual mmap base address for a backing file path.
     std::function<uint64_t(pid_t, const std::string&)> find_mmap_base;
+};
+
+struct WakeEvent {
+    pid_t pid = 0;
+    int64_t return_value = 0;  // 0 for ioctl(BINDER_WRITE_READ), 1 for epoll_pwait
 };
 
 struct BinderIoctlResult {
     bool handled = false;
-    bool park_caller = false;       // Caller has no BR_* events yet; park until woken
-    int64_t return_value = 0;       // 0 or -errno
-    std::vector<pid_t> wake_pids;   // Previously parked threads that now have BR_* data ready
+    bool park_caller = false;
+    bool became_context_mgr = false;
+    BinderDomain domain = BinderDomain::kBinder;
+    int64_t return_value = 0;
+    std::vector<WakeEvent> wakes;
 };
 
 // Isolated 3-domain user-space Binder broker substituting host /dev/*binder.
@@ -44,24 +50,28 @@ public:
     VBinderBroker(const VBinderBroker&) = delete;
     VBinderBroker& operator=(const VBinderBroker&) = delete;
 
-    // Allocates a 1 MiB shared backing file for openat("/dev/*binder") so guest mmap() works natively.
     std::string prepare_open_backing_file(pid_t pid, BinderDomain domain);
 
-    // Registers the FD returned by openat() so subsequent ioctl() calls route to this broker.
     void register_client_fd(pid_t pid, int fd, BinderDomain domain,
                             const std::string& backing_file_path,
                             uint64_t explicit_mmap_base = 0);
 
     bool is_virtual_binder_fd(pid_t pid, int fd) const;
 
-    // Handles a trapped Binder ioctl() for (pid, fd).
+    // Handles epoll_ctl() on a virtual binder FD (required by Android 12 servicemanager Looper).
+    bool handle_epoll_ctl(pid_t pid, int epfd, int op, int target_fd, uint64_t ev_ptr);
+
+    // Checks if (pid, epfd) is watching a virtual binder FD.
+    bool is_watched_epfd(pid_t pid, int epfd) const;
+
+    // Handles epoll_pwait() on a watched epfd: returns 1 immediately if inbox non-empty, else parks.
+    BinderIoctlResult handle_epoll_pwait(pid_t pid, int epfd, uint64_t events_ptr, int maxevents);
+
     BinderIoctlResult handle_ioctl(pid_t pid, int fd, unsigned long cmd,
                                    uint64_t arg_ptr, uint32_t sender_euid);
 
-    // Cleans up a dead guest process and delivers BR_DEAD_BINDER to registered death recipients.
-    std::vector<pid_t> on_process_exit(pid_t pid);
+    std::vector<WakeEvent> on_process_exit(pid_t pid);
 
-    // Helper for domain classification from guest path.
     static bool domain_from_guest_path(std::string_view guest_path, BinderDomain& out_domain);
 
 private:
@@ -81,14 +91,22 @@ private:
     };
 
     struct PendingBrEvent {
-        std::vector<uint8_t> bytes;  // Serialized [uint32_t BR_*][payload...]
+        std::vector<uint8_t> bytes;
     };
 
     struct ParkedWaiter {
+        bool is_epoll = false;
         pid_t pid = 0;
         int fd = -1;
         uint64_t bwr_addr = 0;
         binder::binder_write_read bwr {};
+        uint64_t epoll_events_ptr = 0;
+        struct epoll_event epoll_ev {};
+    };
+
+    struct EpollWatch {
+        int binder_fd = -1;
+        struct epoll_event ev {};
     };
 
     struct ClientState {
@@ -100,12 +118,11 @@ private:
         uint64_t guest_mmap_base = 0;
         size_t rx_cursor = 0;
         uint32_t max_threads = 15;
-        uint32_t next_handle = 1;  // 0 is reserved for context manager
+        uint32_t next_handle = 1;
 
         std::unordered_map<uint32_t, uint64_t> handle_to_node;
         std::unordered_map<uint64_t, uint32_t> node_to_handle;
         std::deque<PendingBrEvent> inbox;
-        // Stack of pending sync transaction callers awaiting our BC_REPLY
         std::deque<pid_t> reply_stack;
     };
 
@@ -128,20 +145,21 @@ private:
     void push_br_payload(ClientState& client, uint32_t br_code, const void* payload, size_t len);
     bool flush_inbox_to_guest(ClientState& client, uint64_t bwr_addr,
                               binder::binder_write_read& bwr);
-    void try_wake_parked(pid_t target_pid, std::vector<pid_t>& out_wakes);
+    void try_wake_parked(pid_t target_pid, std::vector<WakeEvent>& out_wakes);
 
     void process_write_buffer(DomainState& dom, ClientState& sender, uint32_t sender_euid,
                               const std::vector<uint8_t>& wbuf,
-                              std::vector<pid_t>& out_wakes);
+                              std::vector<WakeEvent>& out_wakes);
     void dispatch_transaction(DomainState& dom, ClientState& sender, uint32_t sender_euid,
                               const binder::binder_transaction_data& tr, bool is_reply,
-                              std::vector<pid_t>& out_wakes);
+                              std::vector<WakeEvent>& out_wakes);
 
     std::string rootfs_root_;
     GuestMemOps mem_ops_;
     DomainState domains_[3];
-    // (pid << 32 | fd) -> BinderDomain
     std::unordered_map<uint64_t, BinderDomain> fd_domain_map_;
+    // (pid << 32 | epfd) -> EpollWatch
+    std::unordered_map<uint64_t, EpollWatch> epoll_watches_;
     std::unordered_map<pid_t, ParkedWaiter> parked_;
     uint32_t file_seq_ = 0;
 };

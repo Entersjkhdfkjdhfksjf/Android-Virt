@@ -22,11 +22,11 @@ namespace {
 // Exact Android 12 Bionic prop_area ABI constants
 constexpr uint32_t kPropAreaMagic = 0x504f5250U;   // "PROP"
 constexpr uint32_t kPropAreaVersion = 0xfc6ed0abU; // Android 5+ / 12
-constexpr size_t kPropAreaSize = 256 * 1024;       // 256 KiB (room for ~1500+ props)
+constexpr size_t kPropAreaSize = 128 * 1024;       // Exact Bionic PA_SIZE (128 KiB)
 constexpr size_t kPropAreaHeaderSize = 128;
 constexpr size_t kPropValueMax = 92;               // 91 chars + NUL
 constexpr uint32_t kLongFlag = 1u << 16;
-constexpr uint32_t kLongLegacyErrorOffset = 56;    // offset of uint32_t long_offset inside value[92]
+constexpr uint32_t kLongLegacyErrorOffset = 56;
 
 // Android property_service socket protocol commands
 constexpr uint32_t kPropMsgSetProp = 1;
@@ -64,7 +64,7 @@ struct PropInfo {
 };
 static_assert(sizeof(PropInfo) == 96, "PropInfo header must be 96 bytes");
 
-// Bionic PropertyInfoArea serialized trie structures (Android 10-12)
+// Exact AOSP 12 libpropertyinfoparser serialized trie layout
 struct PropertyInfoAreaHeader {
     uint32_t current_version;
     uint32_t minimum_supported_version;
@@ -73,6 +73,7 @@ struct PropertyInfoAreaHeader {
     uint32_t types_offset;
     uint32_t root_offset;
 };
+static_assert(sizeof(PropertyInfoAreaHeader) == 24, "PropertyInfoAreaHeader must be 24 bytes");
 
 struct PropertyEntrySerialized {
     uint32_t name_offset;
@@ -80,9 +81,12 @@ struct PropertyEntrySerialized {
     uint32_t context_index;
     uint32_t type_index;
 };
+static_assert(sizeof(PropertyEntrySerialized) == 16, "PropertyEntrySerialized must be 16 bytes");
 
+// Exact 32-byte AOSP 12 TrieNodeInternal (offsets, NOT inline PropertyEntrySerialized)
 struct TrieNodeInternal {
-    PropertyEntrySerialized property_entry;
+    uint32_t name;                 // offset to NUL-terminated node name
+    uint32_t property_entry;       // offset to PropertyEntrySerialized (or ~0u)
     uint32_t num_child_nodes;
     uint32_t child_nodes;
     uint32_t num_prefixes;
@@ -90,6 +94,7 @@ struct TrieNodeInternal {
     uint32_t num_exact_matches;
     uint32_t exact_match_entries;
 };
+static_assert(sizeof(TrieNodeInternal) == 32, "TrieNodeInternal must be 32 bytes");
 
 uint32_t align4(uint32_t n) { return (n + 3u) & ~3u; }
 
@@ -143,8 +148,9 @@ PropertyService::~PropertyService() {
 }
 
 bool PropertyService::init_property_info_file() {
-    // Build a valid Bionic PropertyInfoArea with 1 context ("u:object_r:default_prop:s0"),
-    // 1 type ("string"), and a root TrieNodeInternal assigning every property prefix to context 0.
+    // Build a valid AOSP 12 PropertyInfoArea with 1 context ("u:object_r:default_prop:s0"),
+    // 1 type ("string"), and a 32-byte root TrieNodeInternal pointing to a PropertyEntrySerialized
+    // that maps all properties to context_index=0.
     std::vector<uint8_t> buf;
     buf.resize(sizeof(PropertyInfoAreaHeader), 0);
 
@@ -162,6 +168,12 @@ bool PropertyService::init_property_info_file() {
         while (buf.size() % 4 != 0) buf.push_back(0);
         return off;
     };
+    auto append_struct = [&](const void* ptr, size_t sz) -> uint32_t {
+        uint32_t off = static_cast<uint32_t>(buf.size());
+        buf.resize(off + sz);
+        std::memcpy(buf.data() + off, ptr, sz);
+        return off;
+    };
 
     uint32_t default_ctx_str_off = append_str("u:object_r:default_prop:s0");
     uint32_t default_type_str_off = append_str("string");
@@ -175,22 +187,25 @@ bool PropertyService::init_property_info_file() {
     uint32_t types_off = append_u32(1);
     append_u32(default_type_str_off);
 
-    // Root TrieNodeInternal
-    uint32_t root_off = static_cast<uint32_t>(buf.size());
+    // Root PropertyEntrySerialized
+    PropertyEntrySerialized root_entry {};
+    root_entry.name_offset = empty_name_off;
+    root_entry.namelen = 0;
+    root_entry.context_index = 0;
+    root_entry.type_index = 0;
+    uint32_t root_entry_off = append_struct(&root_entry, sizeof(root_entry));
+
+    // Root TrieNodeInternal (32 bytes)
     TrieNodeInternal root {};
-    root.property_entry.name_offset = empty_name_off;
-    root.property_entry.namelen = 0;
-    root.property_entry.context_index = 0;  // u:object_r:default_prop:s0
-    root.property_entry.type_index = 0;     // string
+    root.name = empty_name_off;
+    root.property_entry = root_entry_off;
     root.num_child_nodes = 0;
     root.child_nodes = 0;
     root.num_prefixes = 0;
     root.prefix_entries = 0;
     root.num_exact_matches = 0;
     root.exact_match_entries = 0;
-
-    buf.resize(root_off + sizeof(root));
-    std::memcpy(buf.data() + root_off, &root, sizeof(root));
+    uint32_t root_off = append_struct(&root, sizeof(root));
 
     PropertyInfoAreaHeader hdr {};
     hdr.current_version = 1;
@@ -227,7 +242,6 @@ bool PropertyService::init_prop_area_file(const std::string& path,
     hdr->magic = kPropAreaMagic;
     hdr->version = kPropAreaVersion;
     hdr->serial.store(0, std::memory_order_relaxed);
-    // Reserve root PropBt (20 bytes + 4 bytes NUL-padded empty name)
     hdr->bytes_used = align4(sizeof(PropBt) + 1);
 
     out_map = reinterpret_cast<uint8_t*>(map);
@@ -259,7 +273,6 @@ bool PropertyService::write_prop_info_value(uint32_t prop_off,
     auto* pi = reinterpret_cast<PropInfo*>(data + prop_off);
 
     uint32_t old_serial = pi->serial.load(std::memory_order_relaxed);
-    // Set dirty bit (bit 0) while mutating value
     uint32_t dirty_serial = (old_serial & 0x0000FFFFu) | 1u;
     pi->serial.store(dirty_serial, std::memory_order_release);
 
@@ -272,7 +285,6 @@ bool PropertyService::write_prop_info_value(uint32_t prop_off,
         uint32_t final_serial = (static_cast<uint32_t>(value.size()) << 24) | next_counter;
         pi->serial.store(final_serial, std::memory_order_release);
     } else {
-        // Long property (>= 92 bytes): allocate separate value buffer & store relative offset
         uint32_t long_off = alloc_area_bytes(static_cast<uint32_t>(value.size() + 1));
         if (long_off == 0) return false;
         std::memcpy(data + long_off, value.data(), value.size());
@@ -291,7 +303,6 @@ bool PropertyService::write_prop_info_value(uint32_t prop_off,
     (void)name;
     ::syscall(SYS_futex, &pi->serial, FUTEX_WAKE, INT32_MAX, nullptr, nullptr, 0);
 
-    // Bump both area serial and global properties_serial
     auto* area_hdr = reinterpret_cast<PropAreaHeader*>(area_map_);
     bump_serial_and_wake(reinterpret_cast<uint32_t*>(&area_hdr->serial));
     if (serial_map_) {
@@ -306,7 +317,7 @@ uint32_t PropertyService::find_or_create_prop_info(std::string_view name,
                                                    bool create) {
     if (!area_map_ || name.empty()) return 0;
     uint8_t* data = area_map_ + kPropAreaHeaderSize;
-    uint32_t current_bt_off = 0;  // Root PropBt is at data + 0
+    uint32_t current_bt_off = 0;
 
     size_t pos = 0;
     while (pos < name.size()) {
@@ -333,7 +344,6 @@ uint32_t PropertyService::find_or_create_prop_info(std::string_view name,
             continue;
         }
 
-        // Binary search tree walk among siblings at this dot-level
         uint32_t cur = child_off;
         while (true) {
             auto* bt = reinterpret_cast<PropBt*>(data + cur);
@@ -391,7 +401,6 @@ bool PropertyService::set(std::string_view name, std::string_view value) {
 bool PropertyService::get(std::string_view name, std::string& out_value) const {
     if (name.empty() || !area_map_) return false;
     std::lock_guard<std::mutex> lk(area_mu_);
-    // Const-safe read-only lookup
     uint32_t prop_off = const_cast<PropertyService*>(this)->find_or_create_prop_info(name, "", false);
     if (prop_off == 0) return false;
 
@@ -432,10 +441,10 @@ void PropertyService::load_build_prop_file(const std::string& path) {
 }
 
 void PropertyService::seed_default_aosp12_properties() {
-    // Load GSI build.prop first, then apply container overrides
     load_build_prop_file(rootfs_root_ + "/system/build.prop");
 
     const std::pair<const char*, const char*> defaults[] = {
+        {"ro.property_service.version", "2"},
         {"ro.build.version.sdk", "31"},
         {"ro.build.version.release", "12"},
         {"ro.product.cpu.abi", "arm64-v8a"},
@@ -475,7 +484,6 @@ bool PropertyService::start() {
 
     seed_default_aosp12_properties();
 
-    // Create AF_UNIX SOCK_STREAM listener at <rootfs>/dev/socket/property_service
     ::unlink(socket_path_.c_str());
     listen_fd_ = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (listen_fd_ < 0) return false;
@@ -563,7 +571,6 @@ void PropertyService::handle_client(int client_fd) {
         status = set(name, val) ? kPropSuccess : kPropErrorInvalidArg;
         ::write(client_fd, &status, sizeof(status));
     } else if (cmd == kPropMsgSetProp) {
-        // Legacy fixed-size prop_msg: char name[32], char value[92]
         char name_buf[32] = {};
         char val_buf[kPropValueMax] = {};
         if (!read_exact(client_fd, name_buf, sizeof(name_buf))) return;

@@ -421,17 +421,17 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     return rc;
 }
 
-void Supervisor::wake_parked_binder_threads(const std::vector<pid_t>& pids) {
-    for (pid_t wpid : pids) {
+void Supervisor::wake_parked_binder_threads(const std::vector<WakeEvent>& wakes) {
+    for (const auto& w : wakes) {
         ArchRegs wregs;
-        if (wregs.load(wpid)) {
-            wregs.cancel_syscall(wpid);
-            wregs.set_ret(0);
-            wregs.store(wpid);
+        if (wregs.load(w.pid)) {
+            wregs.cancel_syscall(w.pid);
+            wregs.set_ret(w.return_value);
+            wregs.store(w.pid);
         }
-        auto& wproc = registry_.get_or_create(wpid, cfg_.initial_creds);
+        auto& wproc = registry_.get_or_create(w.pid, cfg_.initial_creds);
         wproc.parked_in_binder = false;
-        ::ptrace(PTRACE_CONT, wpid, nullptr, nullptr);
+        ::ptrace(PTRACE_CONT, w.pid, nullptr, nullptr);
     }
 }
 
@@ -459,6 +459,10 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
         }
 
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (WIFSIGNALED(status) && cfg_.verbose) {
+                std::fprintf(stderr, "[guest_runner] child pid=%d died with signal %d\n",
+                             static_cast<int>(pid), WTERMSIG(status));
+            }
             if (pid == root_child) {
                 root_exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : (128 + WTERMSIG(status));
             }
@@ -522,19 +526,50 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         regs.store(pid);
     };
 
-    // --- 0. Phase 4 Virtual Binder ioctl interception ---
+    // --- 0. Phase 4 Virtual Binder ioctl & epoll interception ---
     if (nr == SYS_ioctl) {
         int fd = static_cast<int>(regs.arg(0));
         unsigned long cmd = static_cast<unsigned long>(regs.arg(1));
         uint64_t arg_ptr = regs.arg(2);
         if (vbinder_.is_virtual_binder_fd(pid, fd)) {
             BinderIoctlResult bres = vbinder_.handle_ioctl(pid, fd, cmd, arg_ptr, proc.creds.euid);
-            wake_parked_binder_threads(bres.wake_pids);
+            if (bres.became_context_mgr && bres.domain == BinderDomain::kBinder) {
+                prop_service_.set("servicemanager.ready", "true");
+                if (cfg_.verbose) {
+                    std::fprintf(stderr, "[guest_runner] servicemanager registered as /dev/binder handle 0\n");
+                }
+            }
+            wake_parked_binder_threads(bres.wakes);
             if (bres.park_caller) {
                 proc.parked_in_binder = true;
                 return;
             }
             skip_with_ret(bres.return_value);
+        }
+        return;
+    }
+    if (nr == SYS_epoll_ctl) {
+        int epfd = static_cast<int>(regs.arg(0));
+        int op = static_cast<int>(regs.arg(1));
+        int target_fd = static_cast<int>(regs.arg(2));
+        uint64_t ev_ptr = regs.arg(3);
+        if (vbinder_.handle_epoll_ctl(pid, epfd, op, target_fd, ev_ptr)) {
+            skip_with_ret(0);
+            return;
+        }
+        return;
+    }
+    if (nr == SYS_epoll_pwait) {
+        int epfd = static_cast<int>(regs.arg(0));
+        if (vbinder_.is_watched_epfd(pid, epfd)) {
+            BinderIoctlResult eres = vbinder_.handle_epoll_pwait(
+                pid, epfd, regs.arg(1), static_cast<int>(regs.arg(2)));
+            if (eres.park_caller) {
+                proc.parked_in_binder = true;
+                return;
+            }
+            skip_with_ret(eres.return_value);
+            return;
         }
         return;
     }

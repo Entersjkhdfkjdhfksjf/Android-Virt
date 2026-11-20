@@ -86,9 +86,11 @@ std::vector<uint32_t> intercepted_syscalls() {
         SYS_unshare,
         SYS_sethostname,
         SYS_setdomainname,
-        // Sockets
+        // Sockets & Binder epoll
         SYS_bind,
         SYS_connect,
+        SYS_epoll_ctl,
+        SYS_epoll_pwait,
     };
 #ifdef SYS_openat2
     nrs.push_back(SYS_openat2);

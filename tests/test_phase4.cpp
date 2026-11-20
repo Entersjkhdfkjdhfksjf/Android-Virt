@@ -105,7 +105,7 @@ int main() {
                                     reinterpret_cast<uint64_t>(&cl_bwr), 1000);
     assert(r_tx.handled && !r_tx.park_caller);
     // servicemanager must have been woken!
-    assert(r_tx.wake_pids.size() == 1 && r_tx.wake_pids[0] == 200);
+    assert(r_tx.wakes.size() == 1 && r_tx.wakes[0].pid == 200);
 
     // Verify client got BR_TRANSACTION_COMPLETE
     uint32_t cl_br = 0;
@@ -152,7 +152,7 @@ int main() {
     sm_bwr.write_buffer = reinterpret_cast<uint64_t>(&sm_reply_batch);
     auto r_rep = broker.handle_ioctl(200, 3, kIoctlBinderWriteRead,
                                      reinterpret_cast<uint64_t>(&sm_bwr), 1000);
-    assert(r_rep.wake_pids.size() == 1 && r_rep.wake_pids[0] == 201);
+    assert(r_rep.wakes.size() == 1 && r_rep.wakes[0].pid == 201);
 
     // Verify client received BR_REPLY with "OK!"
     uint32_t rep_br = 0;
@@ -174,7 +174,7 @@ int main() {
                                reinterpret_cast<uint64_t>(&sm_bwr), 1000).park_caller);
 
     auto death_wakes = broker.on_process_exit(201);
-    assert(death_wakes.size() == 1 && death_wakes[0] == 200);
+    assert(death_wakes.size() == 1 && death_wakes[0].pid == 200);
     uint32_t dead_br = 0;
     uint64_t dead_cookie = 0;
     std::memcpy(&dead_br, sm_rbuf, 4);
