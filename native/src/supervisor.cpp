@@ -768,6 +768,23 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         rewrite_path_arg(0, 1, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
         return;
     }
+    if (nr == SYS_fstat) {
+        int fd = static_cast<int>(regs.arg(0));
+        uint64_t stat_buf = regs.arg(1);
+        char proc_fd[128];
+        std::snprintf(proc_fd, sizeof(proc_fd), "/proc/%d/fd/%d", static_cast<int>(pid), fd);
+        char link_buf[4096];
+        ssize_t n = ::readlink(proc_fd, link_buf, sizeof(link_buf) - 1);
+        std::string gpath;
+        if (n > 0) {
+            link_buf[n] = '\0';
+            gpath = translator_.host_to_guest(std::string_view(link_buf, static_cast<size_t>(n)));
+        }
+        proc.expecting_syscall_exit = true;
+        proc.exit_op = PendingExitOp{ExitPatchKind::kPatchStatBuf,
+                                     -1, 0, -1, 0, stat_buf, sizeof(struct stat), gpath, 0, ""};
+        return;
+    }
     if (nr == SYS_newfstatat) {
         bool follow = (regs.arg(3) & AT_SYMLINK_NOFOLLOW) == 0;
         rewrite_path_arg(0, 1, follow, ExitPatchKind::kPatchStatBuf, regs.arg(2), sizeof(struct stat));
@@ -920,14 +937,22 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
     }
 
     if (op.kind == ExitPatchKind::kPatchStatBuf && op.out_buf_addr != 0) {
-        auto meta = meta_db_.find(op.guest_path);
-        if (meta.has_value()) {
-            struct stat st {};
-            if (read_guest_mem(pid, op.out_buf_addr, &st, sizeof(st))) {
-                st.st_uid = meta->entry->uid;
-                st.st_gid = meta->entry->gid;
-                st.st_mode = (st.st_mode & S_IFMT) | (meta->entry->mode & 07777);
+        struct stat st {};
+        if (read_guest_mem(pid, op.out_buf_addr, &st, sizeof(st))) {
+            if (op.guest_path.rfind("/dev/__properties__", 0) == 0) {
+                // Bionic prop_area::map_prop_area() strictly requires uid==0, gid==0, mode 0644
+                st.st_uid = 0;
+                st.st_gid = 0;
+                st.st_mode = (st.st_mode & S_IFMT) | 0644;
                 write_guest_mem(pid, op.out_buf_addr, &st, sizeof(st));
+            } else {
+                auto meta = meta_db_.find(op.guest_path);
+                if (meta.has_value()) {
+                    st.st_uid = meta->entry->uid;
+                    st.st_gid = meta->entry->gid;
+                    st.st_mode = (st.st_mode & S_IFMT) | (meta->entry->mode & 07777);
+                    write_guest_mem(pid, op.out_buf_addr, &st, sizeof(st));
+                }
             }
         }
     } else if (op.kind == ExitPatchKind::kStripRootfsGetcwd && op.out_buf_addr != 0) {

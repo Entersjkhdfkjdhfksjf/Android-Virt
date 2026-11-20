@@ -45,6 +45,7 @@ std::vector<uint32_t> intercepted_syscalls() {
         // Path & filesystem operations
         SYS_openat,
         SYS_newfstatat,
+        SYS_fstat,
         SYS_faccessat,
         SYS_readlinkat,
         SYS_unlinkat,
