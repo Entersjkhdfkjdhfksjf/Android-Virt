@@ -130,6 +130,9 @@ std::string PseudoFs::generate_content(pid_t pid, std::string_view guest_path,
     if (guest_path == "/proc/uptime") {
         return "1000.00 2000.00\n";
     }
+    if (starts_with(guest_path, "/sys/fs/selinux/class/")) {
+        return "1\n";
+    }
     if (ends_with(guest_path, "/attr/current")) {
         std::string ctx = creds.selinux_ctx;
         ctx.push_back('\0');

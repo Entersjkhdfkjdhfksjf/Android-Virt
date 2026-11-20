@@ -877,6 +877,12 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
     }
     if (nr == SYS_readlinkat) {
         rewrite_path_arg(0, 1, false, ExitPatchKind::kStripRootfsReadlink, regs.arg(2), regs.arg(3));
+        // Even if /proc/self/fd/* was kHostPassThru, still intercept exit to strip host rootfs prefix!
+        if (!proc.expecting_syscall_exit) {
+            proc.expecting_syscall_exit = true;
+            proc.exit_op = PendingExitOp{ExitPatchKind::kStripRootfsReadlink,
+                                         -1, 0, -1, 0, regs.arg(2), regs.arg(3), "", 0, ""};
+        }
         return;
     }
     if (nr == SYS_unlinkat || nr == SYS_mkdirat || nr == SYS_fchmodat || nr == SYS_utimensat) {

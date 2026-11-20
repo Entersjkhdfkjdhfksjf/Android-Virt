@@ -1,7 +1,11 @@
 package com.vguest.app
 
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Color
+import android.widget.Toast
 import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
@@ -129,6 +133,14 @@ class MainActivity : AppCompatActivity() {
             isEnabled = false
             setOnClickListener { stopActiveGuest() }
         }
+        val copyBtn = Button(this).apply {
+            text = "Copy Log"
+            setOnClickListener {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("VGuestLog", logView.text))
+                Toast.makeText(this@MainActivity, "Copied log to clipboard", Toast.LENGTH_SHORT).show()
+            }
+        }
         val clearBtn = Button(this).apply {
             text = "Clear"
             setOnClickListener { logView.text = "" }
@@ -138,6 +150,7 @@ class MainActivity : AppCompatActivity() {
         btnRow.addView(binderTestBtn)
         btnRow.addView(displayTestBtn)
         btnRow.addView(stopBtn)
+        btnRow.addView(copyBtn)
         btnRow.addView(clearBtn)
         root.addView(btnRow)
 
