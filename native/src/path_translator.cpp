@@ -21,7 +21,7 @@ bool is_host_passthru_dev(std::string_view p) {
 }
 
 bool is_virtual_proc_path(std::string_view p) {
-    if (p == "/proc/mounts" || p == "/proc/self/mounts" || p == "/proc/self/mountinfo" ||
+    if (p == "/proc/mounts" || p == "/proc/uptime" || p == "/proc/self/mounts" || p == "/proc/self/mountinfo" ||
         p == "/proc/self/attr/current" || p == "/proc/self/status" || p == "/proc/self/maps") {
         return true;
     }
@@ -41,7 +41,7 @@ bool is_virtual_proc_path(std::string_view p) {
 }
 
 bool is_virtual_sys_path(std::string_view p) {
-    return p == "/sys/fs/selinux/enforce" || p == "/sys/fs/selinux/checkreqprot";
+    return p == "/sys/fs/selinux/enforce" || p == "/sys/fs/selinux/checkreqprot" || p == "/sys/fs/selinux/status";
 }
 
 bool is_virtual_binder_path(std::string_view p) {

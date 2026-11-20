@@ -1,6 +1,7 @@
 #include "pseudo_fs.hpp"
 
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 #include <sys/syscall.h>
@@ -118,6 +119,16 @@ std::string PseudoFs::generate_content(pid_t pid, std::string_view guest_path,
                                        const VirtualCreds& creds) const {
     if (guest_path == "/sys/fs/selinux/enforce" || guest_path == "/sys/fs/selinux/checkreqprot") {
         return "0\n";
+    }
+    if (guest_path == "/sys/fs/selinux/status") {
+        // 4096-byte mmap-able Linux selinux_status_t: version=1, sequence=0, enforcing=0, policyload=1, deny_unknown=0
+        std::string page(4096, '\0');
+        uint32_t hdr[5] = {1u, 0u, 0u, 1u, 0u};
+        std::memcpy(page.data(), hdr, sizeof(hdr));
+        return page;
+    }
+    if (guest_path == "/proc/uptime") {
+        return "1000.00 2000.00\n";
     }
     if (ends_with(guest_path, "/attr/current")) {
         std::string ctx = creds.selinux_ctx;

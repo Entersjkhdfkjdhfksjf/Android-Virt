@@ -819,9 +819,12 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         // Build scratch block below guest SP:
         //   [linker_path ][target_bin_path ][8-byte aligned new_argv ptr array]
         std::string s_linker = interp_tp.host_path;
-        s_linker.push_back(' ');
-        std::string s_bin = tp.host_path;
-        s_bin.push_back(' ');
+        s_linker.push_back('\0');
+        TranslatedPath tp_nofollow = translator_.translate(pid, AT_FDCWD, raw_path, false);
+        std::string s_bin = (tp_nofollow.kind == PathKind::kNormalRootfs && !tp_nofollow.host_path.empty())
+                                ? tp_nofollow.host_path
+                                : tp.host_path;
+        s_bin.push_back('\0');
 
         size_t str_bytes = (s_linker.size() + s_bin.size() + 15u) & ~15u;
         size_t new_argc = 2 + (orig_argv.size() > 1 ? (orig_argv.size() - 1) : 0);
