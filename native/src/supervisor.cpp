@@ -153,7 +153,11 @@ Supervisor::Supervisor(SupervisorConfig cfg)
                    [this](pid_t p, uint64_t a, void* o, size_t l) { return read_guest_mem(p, a, o, l); },
                    [this](pid_t p, uint64_t a, const void* d, size_t l) { return write_guest_mem(p, a, d, l); },
                    [](pid_t p, const std::string& sub) { return find_guest_mmap_base(p, sub); },
-               }) {}
+               }),
+      vinput_(cfg_.rootfs_root, 1400, 876,
+              InputMemOps{[this](pid_t p, uint64_t a, const void* d, size_t l) {
+                  return write_guest_mem(p, a, d, l);
+              }}) {}
 
 uint64_t Supervisor::find_guest_mmap_base(pid_t pid, const std::string& path_substr) {
     char maps_path[64];
@@ -268,6 +272,8 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     if (guest_argv.empty()) return 1;
 
     ::prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
+
+    (void)vinput_.start();
 
     if (cfg_.enable_property_service) {
         if (!prop_service_.start()) {
@@ -417,6 +423,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
         rc = run_ptrace_loop(child);
     }
 
+    vinput_.stop();
     prop_service_.stop();
     return rc;
 }
@@ -466,6 +473,7 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
             if (pid == root_child) {
                 root_exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : (128 + WTERMSIG(status));
             }
+            vinput_.on_process_exit(pid);
             auto wakes = vbinder_.on_process_exit(pid);
             registry_.erase(pid);
             wake_parked_binder_threads(wakes);
@@ -531,6 +539,11 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         int fd = static_cast<int>(regs.arg(0));
         unsigned long cmd = static_cast<unsigned long>(regs.arg(1));
         uint64_t arg_ptr = regs.arg(2);
+        if (vinput_.is_virtual_input_fd(pid, fd)) {
+            int64_t iret = vinput_.handle_ioctl(pid, fd, cmd, arg_ptr);
+            skip_with_ret(iret);
+            return;
+        }
         if (vbinder_.is_virtual_binder_fd(pid, fd)) {
             BinderIoctlResult bres = vbinder_.handle_ioctl(pid, fd, cmd, arg_ptr, proc.creds.euid);
             if (bres.became_context_mgr && bres.domain == BinderDomain::kBinder) {
@@ -706,7 +719,14 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         uint8_t bdom = 0;
         std::string bbacking;
 
-        if (nr == SYS_openat && tp.kind == PathKind::kVirtualBinder) {
+        if (nr == SYS_openat && tp.kind == PathKind::kVirtualInput) {
+            VInputDevice idev = VInputDevice::kTouchscreen;
+            if (VInputHub::device_from_guest_path(tp.guest_path, idev)) {
+                target_host = vinput_.prepare_open_path(idev);
+                bdom = static_cast<uint8_t>(idev);
+                final_exit_kind = ExitPatchKind::kRegisterInputFd;
+            }
+        } else if (nr == SYS_openat && tp.kind == PathKind::kVirtualBinder) {
             BinderDomain dom = BinderDomain::kBinder;
             if (VBinderBroker::domain_from_guest_path(tp.guest_path, dom)) {
                 bbacking = vbinder_.prepare_open_backing_file(pid, dom);
@@ -884,6 +904,12 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
     if (reg_dirty) regs.store(pid);
 
     if (regs.ret() < 0) return;
+
+    if (op.kind == ExitPatchKind::kRegisterInputFd) {
+        vinput_.register_client_fd(pid, static_cast<int>(regs.ret()),
+                                   static_cast<VInputDevice>(op.binder_domain));
+        return;
+    }
 
     if (op.kind == ExitPatchKind::kRegisterBinderFd) {
         int returned_fd = static_cast<int>(regs.ret());

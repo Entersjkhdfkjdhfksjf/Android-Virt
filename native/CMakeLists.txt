@@ -12,6 +12,7 @@ add_library(vguest_core STATIC
     src/seccomp_bpf.cpp
     src/supervisor.cpp
     src/vbinder.cpp
+    src/vinput.cpp
 )
 
 target_include_directories(vguest_core PUBLIC
@@ -31,9 +32,23 @@ endif()
 add_executable(guest_runner src/main.cpp)
 target_link_libraries(guest_runner PRIVATE vguest_core)
 
+add_executable(vguest_fb_demo src/vguest_fb_demo.cpp)
+target_include_directories(vguest_fb_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_options(vguest_fb_demo PRIVATE -Wall -Wextra -O2)
+
 if(ANDROID)
     target_compile_options(guest_runner PRIVATE -fPIE)
     target_link_options(guest_runner PRIVATE -fPIE -pie -static-libstdc++)
+
+    target_compile_options(vguest_fb_demo PRIVATE -fPIE)
+    target_link_options(vguest_fb_demo PRIVATE -fPIE -pie -static-libstdc++)
+
+    # Host JNI ANativeWindow display renderer & evdev input injector
+    add_library(vguest_display SHARED ../android/app/src/main/cpp/display_jni.cpp)
+    target_include_directories(vguest_display PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+    target_compile_options(vguest_display PRIVATE -Wall -Wextra -O2)
+    target_link_libraries(vguest_display PRIVATE android log)
+    target_link_options(vguest_display PRIVATE -static-libstdc++)
 else()
     enable_testing()
     add_executable(test_phase2 ../tests/test_phase2.cpp)
@@ -47,4 +62,8 @@ else()
     add_executable(test_phase4 ../tests/test_phase4.cpp)
     target_link_libraries(test_phase4 PRIVATE vguest_core)
     add_test(NAME phase4_unit_tests COMMAND test_phase4)
+
+    add_executable(test_phase5 ../tests/test_phase5.cpp)
+    target_link_libraries(test_phase5 PRIVATE vguest_core)
+    add_test(NAME phase5_unit_tests COMMAND test_phase5)
 endif()

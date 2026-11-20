@@ -10,6 +10,7 @@
 #include "pseudo_fs.hpp"
 #include "seccomp_bpf.hpp"
 #include "vbinder.hpp"
+#include "vinput.hpp"
 #include "vfs_meta_format.hpp"
 
 namespace vguest {
@@ -50,6 +51,7 @@ private:
     PseudoFs pseudo_fs_;
     PropertyService prop_service_;
     VBinderBroker vbinder_;
+    VInputHub vinput_;
     ProcessRegistry registry_;
 };
 
