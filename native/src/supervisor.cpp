@@ -516,6 +516,49 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
             proc.parked_in_binder = false;
             proc.exit_op = PendingExitOp{};
             ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+        } else if (sig == SIGSYS) {
+            ArchRegs sregs;
+            if (sregs.load(pid)) {
+                int64_t snr = sregs.sysno();
+                if (snr == SYS_setuid) {
+                    uint32_t v = static_cast<uint32_t>(sregs.arg(0));
+                    proc.creds.uid = proc.creds.euid = proc.creds.suid = v;
+                } else if (snr == SYS_setgid) {
+                    uint32_t v = static_cast<uint32_t>(sregs.arg(0));
+                    proc.creds.gid = proc.creds.egid = proc.creds.sgid = v;
+                } else if (snr == SYS_setreuid) {
+                    uint32_t r = static_cast<uint32_t>(sregs.arg(0));
+                    uint32_t e = static_cast<uint32_t>(sregs.arg(1));
+                    if (r != static_cast<uint32_t>(-1)) proc.creds.uid = r;
+                    if (e != static_cast<uint32_t>(-1)) proc.creds.euid = e;
+                } else if (snr == SYS_setregid) {
+                    uint32_t r = static_cast<uint32_t>(sregs.arg(0));
+                    uint32_t e = static_cast<uint32_t>(sregs.arg(1));
+                    if (r != static_cast<uint32_t>(-1)) proc.creds.gid = r;
+                    if (e != static_cast<uint32_t>(-1)) proc.creds.egid = e;
+                } else if (snr == SYS_setresuid) {
+                    uint32_t r = static_cast<uint32_t>(sregs.arg(0));
+                    uint32_t e = static_cast<uint32_t>(sregs.arg(1));
+                    uint32_t s = static_cast<uint32_t>(sregs.arg(2));
+                    if (r != static_cast<uint32_t>(-1)) proc.creds.uid = r;
+                    if (e != static_cast<uint32_t>(-1)) proc.creds.euid = e;
+                    if (s != static_cast<uint32_t>(-1)) proc.creds.suid = s;
+                } else if (snr == SYS_setresgid) {
+                    uint32_t r = static_cast<uint32_t>(sregs.arg(0));
+                    uint32_t e = static_cast<uint32_t>(sregs.arg(1));
+                    uint32_t s = static_cast<uint32_t>(sregs.arg(2));
+                    if (r != static_cast<uint32_t>(-1)) proc.creds.gid = r;
+                    if (e != static_cast<uint32_t>(-1)) proc.creds.egid = e;
+                    if (s != static_cast<uint32_t>(-1)) proc.creds.sgid = s;
+                }
+                if (cfg_.verbose) {
+                    std::fprintf(stderr, "[guest_runner] spoofed host-blocked syscall %lld -> 0\n",
+                                 static_cast<long long>(snr));
+                }
+                sregs.set_ret(0);
+                sregs.store(pid);
+            }
+            ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
         } else {
             int deliver_sig = (sig == SIGTRAP || sig == SIGSTOP) ? 0 : sig;
             ::ptrace(PTRACE_CONT, pid, nullptr,
@@ -620,6 +663,22 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
     if (nr == SYS_setgid) {
         uint32_t v = static_cast<uint32_t>(regs.arg(0));
         proc.creds.gid = proc.creds.egid = proc.creds.sgid = v;
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_setreuid) {
+        uint32_t r = static_cast<uint32_t>(regs.arg(0));
+        uint32_t e = static_cast<uint32_t>(regs.arg(1));
+        if (r != static_cast<uint32_t>(-1)) proc.creds.uid = r;
+        if (e != static_cast<uint32_t>(-1)) proc.creds.euid = e;
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_setregid) {
+        uint32_t r = static_cast<uint32_t>(regs.arg(0));
+        uint32_t e = static_cast<uint32_t>(regs.arg(1));
+        if (r != static_cast<uint32_t>(-1)) proc.creds.gid = r;
+        if (e != static_cast<uint32_t>(-1)) proc.creds.egid = e;
         skip_with_ret(0);
         return;
     }
