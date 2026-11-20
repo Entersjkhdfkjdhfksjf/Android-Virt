@@ -74,37 +74,41 @@ int main(int argc, char** argv) {
     vguest::BootSequencer boot(cfg.rootfs_root);
     std::vector<std::string> guest_env = boot.load_init_environ();
 
-    int zygote_sock_fd = -1;
+    std::vector<int> inherited_fds;
+    auto bind_init_socket = [&](const char* sock_name, const char* env_name) {
+        std::string sock_dir = cfg.rootfs_root + "/dev/socket";
+        ::mkdir((cfg.rootfs_root + "/dev").c_str(), 0755);
+        ::mkdir(sock_dir.c_str(), 0755);
+        std::string spath = sock_dir + "/" + sock_name;
+        ::unlink(spath.c_str());
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);  // inherited across execve (no CLOEXEC)
+        if (fd < 0) return;
+        struct sockaddr_un addr {};
+        addr.sun_family = AF_UNIX;
+        if (spath.size() < sizeof(addr.sun_path)) {
+            std::strncpy(addr.sun_path, spath.c_str(), sizeof(addr.sun_path) - 1);
+            if (::bind(fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                ::listen(fd, 16) == 0) {
+                ::chmod(spath.c_str(), 0666);
+                guest_env.push_back(std::string(env_name) + "=" + std::to_string(fd));
+                inherited_fds.push_back(fd);
+                return;
+            }
+        }
+        ::close(fd);
+    };
+
     if (boot_stage != vguest::BootStage::kNone) {
         (void)boot.provision_vintf_manifest();
         if (boot_stage == vguest::BootStage::kFull) {
-            std::string sock_dir = cfg.rootfs_root + "/dev/socket";
-            ::mkdir((cfg.rootfs_root + "/dev").c_str(), 0755);
-            ::mkdir(sock_dir.c_str(), 0755);
-            std::string zpath = sock_dir + "/zygote";
-            ::unlink(zpath.c_str());
-            zygote_sock_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);  // inherited across execve (no CLOEXEC)
-            if (zygote_sock_fd >= 0) {
-                struct sockaddr_un addr {};
-                addr.sun_family = AF_UNIX;
-                if (zpath.size() < sizeof(addr.sun_path)) {
-                    std::strncpy(addr.sun_path, zpath.c_str(), sizeof(addr.sun_path) - 1);
-                    if (::bind(zygote_sock_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0 &&
-                        ::listen(zygote_sock_fd, 16) == 0) {
-                        ::chmod(zpath.c_str(), 0666);
-                        guest_env.push_back("ANDROID_SOCKET_zygote=" + std::to_string(zygote_sock_fd));
-                    } else {
-                        ::close(zygote_sock_fd);
-                        zygote_sock_fd = -1;
-                    }
-                }
-            }
+            bind_init_socket("zygote", "ANDROID_SOCKET_zygote");
+            bind_init_socket("usap_pool_primary", "ANDROID_SOCKET_usap_pool_primary");
         }
         guest_argv = {"/system/bin/sh", "-c", boot.build_stage_script(boot_stage)};
     }
 
     vguest::Supervisor sup(std::move(cfg));
     int rc = sup.run(guest_argv, guest_env);
-    if (zygote_sock_fd >= 0) ::close(zygote_sock_fd);
+    for (int fd : inherited_fds) ::close(fd);
     return rc;
 }
