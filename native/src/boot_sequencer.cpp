@@ -287,6 +287,42 @@ bool BootSequencer::provision_vintf_manifest() const {
         }
     }
 
+    // Ensure EVERY non-default namespace (com_android_art, com_android_i18n, com_android_conscrypt, etc.)
+    // has `visible = true` so libnativeloader's android_get_exported_namespace() finds them all!
+    {
+        std::string ld_path = rootfs_root_ + "/linkerconfig/ld.config.txt";
+        std::ifstream lin(ld_path);
+        if (lin.is_open()) {
+            std::vector<std::string> lines;
+            std::string line;
+            while (std::getline(lin, line)) lines.push_back(line);
+            lin.close();
+
+            std::vector<std::string> out_lines;
+            bool changed = false;
+            for (size_t i = 0; i < lines.size(); ++i) {
+                out_lines.push_back(lines[i]);
+                const std::string& l = lines[i];
+                const std::string suf = ".isolated = false";
+                if (l.rfind("namespace.", 0) == 0 && l.size() > suf.size() &&
+                    l.compare(l.size() - suf.size(), suf.size(), suf) == 0 &&
+                    l.rfind("namespace.default.", 0) != 0) {
+                    std::string ns_prefix = l.substr(0, l.size() - suf.size());
+                    std::string vis_line = ns_prefix + ".visible = true";
+                    bool has_vis = (i + 1 < lines.size() && lines[i + 1] == vis_line);
+                    if (!has_vis) {
+                        out_lines.push_back(vis_line);
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) {
+                std::ofstream lout(ld_path, std::ios::trunc);
+                for (const auto& ol : out_lines) lout << ol << "\n";
+            }
+        }
+    }
+
     std::ofstream out(rootfs_root_ + "/vendor/etc/vintf/manifest.xml", std::ios::trunc);
     if (!out.is_open()) return false;
     out << kManifestXml;
