@@ -208,8 +208,33 @@ class MainActivity : AppCompatActivity() {
             "echo '--- Querying service list via virtual /dev/binder ---'",
             "/system/bin/service list",
             "kill \$SM_PID 2>/dev/null || true"
-        ).joinToString("; ")
+        ).joinToString("\n")
         runGuestShell(script)
+    }
+
+    private fun fixLinkerConfigIfNeeded() {
+        val cfg = File(rootfsDir, "linkerconfig/ld.config.txt")
+        if (!cfg.isFile) return
+        val lines = cfg.readLines()
+        val linkVals = mutableListOf<String>()
+        val out = mutableListOf<String>()
+        var insertIdx = -1
+        for (line in lines) {
+            if (line.startsWith("namespace.default.links = ")) {
+                if (insertIdx == -1) insertIdx = out.size
+                val v = line.removePrefix("namespace.default.links = ").trim()
+                v.split(',').map { it.trim() }.filter { it.isNotEmpty() }.forEach {
+                    if (it !in linkVals) linkVals.add(it)
+                }
+            } else {
+                out.add(line)
+            }
+        }
+        if (linkVals.size > 1 && lines.count { it.startsWith("namespace.default.links = ") } > 1) {
+            out.add(insertIdx, "namespace.default.links = " + linkVals.joinToString(","))
+            cfg.writeText(out.joinToString("\n") + "\n")
+            appendLog("[fix] Cleaned duplicate namespace.default.links in /linkerconfig/ld.config.txt")
+        }
     }
 
     private fun runGuestShell(shellCmd: String) {
@@ -222,6 +247,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        fixLinkerConfigIfNeeded()
         setBusy(true)
         appendLog("\n=== Executing in AOSP 12 Guest ===")
         executor.execute {

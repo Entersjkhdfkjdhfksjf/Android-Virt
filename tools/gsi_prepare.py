@@ -912,8 +912,9 @@ def generate_linker_config(rootfs: Path, apex_modules: List[Tuple[str, int]], me
         f"namespace.default.search.paths = {':'.join(default_search)}",
         "namespace.default.permitted.paths = /system:/system_ext:/product:/vendor:/apex:/data",
     ]
+    if ns_list:
+        lines.append(f"namespace.default.links = {','.join(ns_list)}")
     for ns in ns_list:
-        lines.append(f"namespace.default.links = {ns}")
         lines.append(f"namespace.default.link.{ns}.allow_all_shared_libs = true")
 
     lines += [
