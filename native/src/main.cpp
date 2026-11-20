@@ -2,6 +2,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <vector>
 
 #include "boot_sequencer.hpp"
@@ -70,11 +74,37 @@ int main(int argc, char** argv) {
     vguest::BootSequencer boot(cfg.rootfs_root);
     std::vector<std::string> guest_env = boot.load_init_environ();
 
+    int zygote_sock_fd = -1;
     if (boot_stage != vguest::BootStage::kNone) {
         (void)boot.provision_vintf_manifest();
+        if (boot_stage == vguest::BootStage::kFull) {
+            std::string sock_dir = cfg.rootfs_root + "/dev/socket";
+            ::mkdir((cfg.rootfs_root + "/dev").c_str(), 0755);
+            ::mkdir(sock_dir.c_str(), 0755);
+            std::string zpath = sock_dir + "/zygote";
+            ::unlink(zpath.c_str());
+            zygote_sock_fd = ::socket(AF_UNIX, SOCK_STREAM, 0);  // inherited across execve (no CLOEXEC)
+            if (zygote_sock_fd >= 0) {
+                struct sockaddr_un addr {};
+                addr.sun_family = AF_UNIX;
+                if (zpath.size() < sizeof(addr.sun_path)) {
+                    std::strncpy(addr.sun_path, zpath.c_str(), sizeof(addr.sun_path) - 1);
+                    if (::bind(zygote_sock_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) == 0 &&
+                        ::listen(zygote_sock_fd, 16) == 0) {
+                        ::chmod(zpath.c_str(), 0666);
+                        guest_env.push_back("ANDROID_SOCKET_zygote=" + std::to_string(zygote_sock_fd));
+                    } else {
+                        ::close(zygote_sock_fd);
+                        zygote_sock_fd = -1;
+                    }
+                }
+            }
+        }
         guest_argv = {"/system/bin/sh", "-c", boot.build_stage_script(boot_stage)};
     }
 
     vguest::Supervisor sup(std::move(cfg));
-    return sup.run(guest_argv, guest_env);
+    int rc = sup.run(guest_argv, guest_env);
+    if (zygote_sock_fd >= 0) ::close(zygote_sock_fd);
+    return rc;
 }

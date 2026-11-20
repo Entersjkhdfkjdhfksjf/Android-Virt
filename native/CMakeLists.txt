@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(vguest_core STATIC
     src/boot_sequencer.cpp
+    src/logd_sink.cpp
     src/path_translator.cpp
     src/prop_service.cpp
     src/pseudo_fs.cpp

@@ -10,6 +10,7 @@
 #include "pseudo_fs.hpp"
 #include "seccomp_bpf.hpp"
 #include "vbinder.hpp"
+#include "logd_sink.hpp"
 #include "vinput.hpp"
 #include "vfs_meta_format.hpp"
 
@@ -52,6 +53,7 @@ private:
     PropertyService prop_service_;
     VBinderBroker vbinder_;
     VInputHub vinput_;
+    LogdSink logd_;
     ProcessRegistry registry_;
 };
 

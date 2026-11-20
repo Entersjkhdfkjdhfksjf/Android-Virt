@@ -157,7 +157,8 @@ Supervisor::Supervisor(SupervisorConfig cfg)
       vinput_(cfg_.rootfs_root, 1400, 876,
               InputMemOps{[this](pid_t p, uint64_t a, const void* d, size_t l) {
                   return write_guest_mem(p, a, d, l);
-              }}) {}
+              }}),
+      logd_(cfg_.rootfs_root) {}
 
 uint64_t Supervisor::find_guest_mmap_base(pid_t pid, const std::string& path_substr) {
     char maps_path[64];
@@ -273,6 +274,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
 
     ::prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 
+    (void)logd_.start();
     (void)vinput_.start();
 
     if (cfg_.enable_property_service) {
@@ -424,6 +426,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     vinput_.stop();
+    logd_.stop();
     prop_service_.stop();
     return rc;
 }
