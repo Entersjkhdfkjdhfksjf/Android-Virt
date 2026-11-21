@@ -197,10 +197,74 @@ bool BootSequencer::provision_vintf_manifest() const {
         "/data/vendor_de/0",
         "/data/app",
         "/data/data",
+        "/data/anr",
+        "/data/tombstones",
+        "/data/local/tmp",
+        "/data/system/users/0",
+        "/data/system/sync",
+        "/data/system/dropbox",
+        "/data/system/usagestats",
+        "/data/system/job",
+        "/data/system/netstats",
+        "/data/system/procstats",
+        "/data/system/shared_prefs",
+        "/data/system/graphicsstats",
+        "/data/misc/keystore",
+        "/data/misc/profiles/cur/0",
+        "/data/misc/profiles/ref",
+        "/data/misc/wifi",
+        "/data/misc/bluedroid",
+        "/data/misc/adb",
+        "/cache/recovery",
+        "/mnt/user/0/self",
+        "/mnt/user/0/emulated/0",
+        "/mnt/user/0/package",
+        "/mnt/pass_through/0/emulated/0",
+        "/mnt/androidwritable/0/emulated/0",
+        "/mnt/installer/0/emulated/0",
+        "/mnt/runtime/default",
+        "/mnt/runtime/read",
+        "/mnt/runtime/write",
+        "/mnt/runtime/full",
+        "/storage/self",
+        "/storage/emulated/0/Android/data",
+        "/storage/emulated/0/Android/obb",
+        "/sys/fs/selinux/class/service_manager/perms",
+        "/sys/fs/selinux/class/hwservice_manager/perms",
+        "/sys/fs/selinux/class/property_service/perms",
+        "/sys/fs/selinux/class/binder/perms",
+        "/sys/fs/selinux/class/keystore_key/perms",
     };
     for (const char* d : dirs) {
         mkdir_p(rootfs_root_ + d);
     }
+
+    // Populate real /sys/fs/selinux/class/* directories so libselinux discover_class()
+    // can opendir(.../perms) and read index/perm files natively.
+    auto write_text_file = [&](const std::string& rel, const char* txt) {
+        std::ofstream f(rootfs_root_ + rel, std::ios::trunc);
+        if (f.is_open()) f << txt;
+    };
+    write_text_file("/sys/fs/selinux/class/service_manager/index", "1\n");
+    write_text_file("/sys/fs/selinux/class/service_manager/perms/add", "1\n");
+    write_text_file("/sys/fs/selinux/class/service_manager/perms/find", "2\n");
+    write_text_file("/sys/fs/selinux/class/service_manager/perms/list", "3\n");
+    write_text_file("/sys/fs/selinux/class/hwservice_manager/index", "2\n");
+    write_text_file("/sys/fs/selinux/class/hwservice_manager/perms/add", "1\n");
+    write_text_file("/sys/fs/selinux/class/hwservice_manager/perms/find", "2\n");
+    write_text_file("/sys/fs/selinux/class/hwservice_manager/perms/list", "3\n");
+    write_text_file("/sys/fs/selinux/class/property_service/index", "3\n");
+    write_text_file("/sys/fs/selinux/class/property_service/perms/set", "1\n");
+    write_text_file("/sys/fs/selinux/class/binder/index", "4\n");
+    write_text_file("/sys/fs/selinux/class/binder/perms/impersonate", "1\n");
+    write_text_file("/sys/fs/selinux/class/binder/perms/call", "2\n");
+    write_text_file("/sys/fs/selinux/class/binder/perms/set_context_mgr", "3\n");
+    write_text_file("/sys/fs/selinux/class/binder/perms/transfer", "4\n");
+    write_text_file("/sys/fs/selinux/class/keystore_key/index", "5\n");
+    write_text_file("/sys/fs/selinux/class/keystore_key/perms/use", "1\n");
+    write_text_file("/sys/fs/selinux/class/keystore_key/perms/insert", "2\n");
+    write_text_file("/sys/fs/selinux/class/keystore_key/perms/delete", "3\n");
+    write_text_file("/sys/fs/selinux/class/keystore_key/perms/get_info", "4\n");
 
     const char* kManifestXml = R"XML(<manifest version="4.0" type="device" target-level="6">
     <hal format="hidl">

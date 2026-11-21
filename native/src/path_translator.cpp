@@ -31,7 +31,7 @@ bool is_virtual_proc_path(std::string_view p) {
         auto slash = rest.find('/');
         if (slash != std::string_view::npos && slash > 0) {
             auto tail = rest.substr(slash);
-            if (tail == "/attr/current" || tail == "/status" || tail == "/maps" ||
+            if (tail == "/attr/current" || tail == "/attr/exec" || tail == "/status" || tail == "/maps" ||
                 tail == "/mountinfo" || tail == "/mounts") {
                 return true;
             }
@@ -41,7 +41,8 @@ bool is_virtual_proc_path(std::string_view p) {
 }
 
 bool is_virtual_sys_path(std::string_view p) {
-    return p == "/sys/fs/selinux/enforce" || p == "/sys/fs/selinux/checkreqprot" || p == "/sys/fs/selinux/status" || starts_with(p, "/sys/fs/selinux/class/");
+    return p == "/sys/fs/selinux/enforce" || p == "/sys/fs/selinux/checkreqprot" ||
+           p == "/sys/fs/selinux/status" || p == "/sys/fs/selinux/access";
 }
 
 bool is_virtual_binder_path(std::string_view p) {
@@ -117,6 +118,9 @@ PathKind PathTranslator::classify_guest_path(std::string_view guest_abs) const {
     if (is_host_passthru_dev(guest_abs)) return PathKind::kHostPassThru;
     if (is_virtual_proc_path(guest_abs)) return PathKind::kVirtualProc;
     if (is_virtual_sys_path(guest_abs)) return PathKind::kVirtualSys;
+    if (starts_with(guest_abs, "/sys/fs/selinux/class/") || guest_abs == "/sys/fs/selinux/class") {
+        return PathKind::kNormalRootfs;
+    }
     // Allow read-only host /proc and /sys fallthrough for unvirtualized nodes (e.g. /sys/devices/system/cpu)
     if (starts_with(guest_abs, "/proc/") || guest_abs == "/proc" ||
         starts_with(guest_abs, "/sys/") || guest_abs == "/sys") {

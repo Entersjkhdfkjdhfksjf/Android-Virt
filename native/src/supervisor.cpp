@@ -302,7 +302,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p6-sysserver-v2\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -700,6 +700,32 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         if (e != static_cast<uint32_t>(-1)) proc.creds.egid = e;
         if (s != static_cast<uint32_t>(-1)) proc.creds.sgid = s;
         skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_prctl) {
+        int opt = static_cast<int>(regs.arg(0));
+        // Spoof capability bounding-set / ambient / keepcaps / seccomp prctls inside Zygote SpecializeCommon()
+        if (opt == 24 /*PR_CAPBSET_DROP*/ || opt == 8 /*PR_SET_KEEPCAPS*/ ||
+            opt == 47 /*PR_CAP_AMBIENT*/ || opt == 22 /*PR_SET_SECCOMP*/) {
+            skip_with_ret(0);
+            return;
+        }
+        return;
+    }
+#ifdef SYS_seccomp
+    if (nr == SYS_seccomp) {
+        // Prevent guest Zygote/system_server from stacking conflicting seccomp filters over guest_runner
+        skip_with_ret(0);
+        return;
+    }
+#endif
+    if (nr == SYS_prlimit64) {
+        // Allow getrlimit (old_limit != 0) natively; spoof setrlimit-only calls (new_limit != 0 && old_limit == 0)
+        // so Zygote SetRLimits() never aborts with EPERM on unprivileged host.
+        if (regs.arg(2) != 0 && regs.arg(3) == 0) {
+            skip_with_ret(0);
+            return;
+        }
         return;
     }
     if (nr == SYS_setgroups || nr == SYS_capset || nr == SYS_fchownat || nr == SYS_fchown ||

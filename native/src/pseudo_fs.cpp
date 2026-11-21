@@ -133,7 +133,12 @@ std::string PseudoFs::generate_content(pid_t pid, std::string_view guest_path,
     if (starts_with(guest_path, "/sys/fs/selinux/class/")) {
         return "1\n";
     }
-    if (ends_with(guest_path, "/attr/current")) {
+    if (guest_path == "/sys/fs/selinux/access") {
+        // libselinux writes ~60-250 bytes of query at offset 0 then reads from the current offset
+        // without seeking and parses with sscanf("%x %x %x %x %u %x"), which skips leading spaces.
+        return std::string(512, ' ') + "ffffffff ffffffff 0 ffffffff 1 0\n";
+    }
+    if (ends_with(guest_path, "/attr/current") || ends_with(guest_path, "/attr/exec")) {
         std::string ctx = creds.selinux_ctx;
         ctx.push_back('\0');
         return ctx;

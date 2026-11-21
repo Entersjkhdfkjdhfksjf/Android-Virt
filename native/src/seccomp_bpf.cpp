@@ -80,6 +80,7 @@ std::vector<uint32_t> intercepted_syscalls() {
         SYS_capget,
         SYS_capset,
         SYS_prctl,
+        SYS_prlimit64,
         // Mounts & namespaces
         SYS_mount,
         SYS_umount2,
@@ -96,6 +97,9 @@ std::vector<uint32_t> intercepted_syscalls() {
         SYS_epoll_ctl,
         SYS_epoll_pwait,
     };
+#ifdef SYS_seccomp
+    nrs.push_back(SYS_seccomp);
+#endif
 #ifdef SYS_openat2
     nrs.push_back(SYS_openat2);
 #endif
