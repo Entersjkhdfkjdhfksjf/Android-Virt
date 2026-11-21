@@ -338,15 +338,57 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     }
 
     const size_t num_offs = offsets.size() / sizeof(binder::binder_size_t);
+    std::vector<uint64_t> sg_guest_addrs(num_offs, 0);
+    std::vector<size_t> sg_ring_offs(num_offs, 0);
+    std::vector<binder::binder_ptr_cookie> pending_node_refs;
+    constexpr uint32_t kBinderBufferFlagHasParent = 0x01;
+
     for (size_t i = 0; i < num_offs; ++i) {
         binder::binder_size_t obj_off = 0;
         std::memcpy(&obj_off, offsets.data() + i * sizeof(binder::binder_size_t), sizeof(obj_off));
-        if (obj_off + sizeof(binder::flat_binder_object) > payload.size()) continue;
+        if (obj_off + sizeof(binder::binder_object_header) > payload.size()) continue;
 
+        uint32_t obj_type = 0;
+        std::memcpy(&obj_type, payload.data() + obj_off, sizeof(obj_type));
+
+        if (obj_type == binder::kBinderTypePtr) {
+            if (obj_off + sizeof(binder::binder_buffer_object) > payload.size()) continue;
+            auto* bbo = reinterpret_cast<binder::binder_buffer_object*>(payload.data() + obj_off);
+            size_t child_ring_off = 0;
+            size_t alloc_len = static_cast<size_t>(bbo->length);
+            uint64_t child_guest_ptr = alloc_rx_space(target, std::max<size_t>(alloc_len, 8), child_ring_off);
+            if (child_guest_ptr == 0) {
+                push_br_code(sender, binder::kBrFailedReply);
+                return;
+            }
+            if (alloc_len > 0 && bbo->buffer != 0) {
+                if (!mem_ops_.read(sender.pid, bbo->buffer, target.rx_map + child_ring_off, alloc_len)) {
+                    push_br_code(sender, binder::kBrFailedReply);
+                    return;
+                }
+            }
+            bbo->buffer = child_guest_ptr;
+            sg_guest_addrs[i] = child_guest_ptr;
+            sg_ring_offs[i] = child_ring_off;
+
+            if ((bbo->flags & kBinderBufferFlagHasParent) != 0 &&
+                bbo->parent < i && sg_guest_addrs[bbo->parent] != 0) {
+                std::memcpy(target.rx_map + sg_ring_offs[bbo->parent] + bbo->parent_offset,
+                            &child_guest_ptr, sizeof(child_guest_ptr));
+            }
+            continue;
+        }
+
+        if (obj_off + sizeof(binder::flat_binder_object) > payload.size()) continue;
         auto* obj = reinterpret_cast<binder::flat_binder_object*>(payload.data() + obj_off);
         if (obj->hdr.type == binder::kBinderTypeBinder ||
             obj->hdr.type == binder::kBinderTypeWeakBinder) {
             uint64_t node_id = get_or_create_node(dom, sender.pid, obj->binder, obj->cookie);
+            auto nit = dom.nodes.find(node_id);
+            if (nit != dom.nodes.end() && !nit->second.driver_refs_sent) {
+                nit->second.driver_refs_sent = true;
+                pending_node_refs.push_back(binder::binder_ptr_cookie{obj->binder, obj->cookie});
+            }
             uint32_t new_handle = get_or_create_handle(target, node_id);
             obj->hdr.type = (obj->hdr.type == binder::kBinderTypeBinder)
                                 ? binder::kBinderTypeHandle
@@ -421,6 +463,10 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     }
 
     push_br_code(sender, binder::kBrTransactionComplete);
+    for (const auto& pc : pending_node_refs) {
+        push_br_payload(sender, binder::kBrIncrefs, &pc, sizeof(pc));
+        push_br_payload(sender, binder::kBrAcquire, &pc, sizeof(pc));
+    }
     try_wake_parked(target.pid, out_wakes);
 }
 

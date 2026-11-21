@@ -90,6 +90,7 @@ private:
         uint64_t cookie = 0;
         uint32_t strong_refs = 1;
         uint32_t weak_refs = 0;
+        bool driver_refs_sent = false;
     };
 
     struct DeathSubscription {
