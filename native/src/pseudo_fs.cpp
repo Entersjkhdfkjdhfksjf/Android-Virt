@@ -138,7 +138,12 @@ std::string PseudoFs::generate_content(pid_t pid, std::string_view guest_path,
         // without seeking and parses with sscanf("%x %x %x %x %u %x"), which skips leading spaces.
         return std::string(512, ' ') + "ffffffff ffffffff 0 ffffffff 1 0\n";
     }
-    if (ends_with(guest_path, "/attr/current") || ends_with(guest_path, "/attr/exec")) {
+    if (guest_path == "/sys/fs/selinux/context") {
+        return "0\n";
+    }
+    if (ends_with(guest_path, "/attr/current") || ends_with(guest_path, "/attr/exec") ||
+        ends_with(guest_path, "/attr/prev") || ends_with(guest_path, "/attr/fscreate") ||
+        ends_with(guest_path, "/attr/sockcreate") || ends_with(guest_path, "/attr/keycreate")) {
         std::string ctx = creds.selinux_ctx;
         ctx.push_back('\0');
         return ctx;

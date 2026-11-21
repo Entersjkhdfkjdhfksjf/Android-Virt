@@ -65,10 +65,18 @@ public:
     bool is_watched_epfd(pid_t pid, int epfd) const;
 
     // Handles epoll_pwait() on a watched epfd: returns 1 immediately if inbox non-empty, else parks.
-    BinderIoctlResult handle_epoll_pwait(pid_t pid, int epfd, uint64_t events_ptr, int maxevents);
+    BinderIoctlResult handle_epoll_pwait(pid_t tgid, pid_t tid, int epfd,
+                                         uint64_t events_ptr, int maxevents);
+    BinderIoctlResult handle_epoll_pwait(pid_t pid, int epfd, uint64_t events_ptr, int maxevents) {
+        return handle_epoll_pwait(pid, pid, epfd, events_ptr, maxevents);
+    }
 
-    BinderIoctlResult handle_ioctl(pid_t pid, int fd, unsigned long cmd,
+    BinderIoctlResult handle_ioctl(pid_t tgid, pid_t tid, int fd, unsigned long cmd,
                                    uint64_t arg_ptr, uint32_t sender_euid);
+    BinderIoctlResult handle_ioctl(pid_t pid, int fd, unsigned long cmd,
+                                   uint64_t arg_ptr, uint32_t sender_euid) {
+        return handle_ioctl(pid, pid, fd, cmd, arg_ptr, sender_euid);
+    }
 
     std::vector<WakeEvent> on_process_exit(pid_t pid);
 
@@ -96,6 +104,7 @@ private:
 
     struct ParkedWaiter {
         bool is_epoll = false;
+        pid_t tgid = 0;
         pid_t pid = 0;
         int fd = -1;
         uint64_t bwr_addr = 0;
@@ -143,9 +152,9 @@ private:
 
     void push_br_code(ClientState& client, uint32_t br_code);
     void push_br_payload(ClientState& client, uint32_t br_code, const void* payload, size_t len);
-    bool flush_inbox_to_guest(ClientState& client, uint64_t bwr_addr,
+    bool flush_inbox_to_guest(ClientState& client, pid_t target_tid, uint64_t bwr_addr,
                               binder::binder_write_read& bwr);
-    void try_wake_parked(pid_t target_pid, std::vector<WakeEvent>& out_wakes);
+    void try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& out_wakes);
 
     void process_write_buffer(DomainState& dom, ClientState& sender, uint32_t sender_euid,
                               const std::vector<uint8_t>& wbuf,

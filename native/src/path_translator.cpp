@@ -20,19 +20,26 @@ bool is_host_passthru_dev(std::string_view p) {
            p == "/dev/tty" || p == "/dev/ptmx" || starts_with(p, "/dev/pts/");
 }
 
+bool ends_with(std::string_view s, std::string_view suf) {
+    return s.size() >= suf.size() && s.substr(s.size() - suf.size()) == suf;
+}
+
 bool is_virtual_proc_path(std::string_view p) {
     if (p == "/proc/mounts" || p == "/proc/uptime" || p == "/proc/self/mounts" || p == "/proc/self/mountinfo" ||
-        p == "/proc/self/attr/current" || p == "/proc/self/status" || p == "/proc/self/maps") {
+        p == "/proc/self/status" || p == "/proc/self/maps") {
         return true;
     }
-    // Match /proc/<pid>/attr/current, /proc/<pid>/status, /proc/<pid>/maps, /proc/<pid>/mountinfo
     if (starts_with(p, "/proc/")) {
+        if (ends_with(p, "/attr/current") || ends_with(p, "/attr/exec") ||
+            ends_with(p, "/attr/prev") || ends_with(p, "/attr/fscreate") ||
+            ends_with(p, "/attr/sockcreate") || ends_with(p, "/attr/keycreate")) {
+            return true;
+        }
         auto rest = p.substr(6);
         auto slash = rest.find('/');
         if (slash != std::string_view::npos && slash > 0) {
             auto tail = rest.substr(slash);
-            if (tail == "/attr/current" || tail == "/attr/exec" || tail == "/status" || tail == "/maps" ||
-                tail == "/mountinfo" || tail == "/mounts") {
+            if (tail == "/status" || tail == "/maps" || tail == "/mountinfo" || tail == "/mounts") {
                 return true;
             }
         }
@@ -42,7 +49,8 @@ bool is_virtual_proc_path(std::string_view p) {
 
 bool is_virtual_sys_path(std::string_view p) {
     return p == "/sys/fs/selinux/enforce" || p == "/sys/fs/selinux/checkreqprot" ||
-           p == "/sys/fs/selinux/status" || p == "/sys/fs/selinux/access";
+           p == "/sys/fs/selinux/status" || p == "/sys/fs/selinux/access" ||
+           p == "/sys/fs/selinux/context";
 }
 
 bool is_virtual_binder_path(std::string_view p) {

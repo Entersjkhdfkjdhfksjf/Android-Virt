@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
+#include <fstream>
 #include <string>
 #include <sys/types.h>
 #include <unordered_map>
@@ -58,25 +60,51 @@ struct ProcessState {
 
 class ProcessRegistry {
 public:
+    static pid_t read_tgid_from_proc(pid_t tid) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/%d/status", static_cast<int>(tid));
+        std::ifstream in(path);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.rfind("Tgid:", 0) == 0) {
+                try {
+                    pid_t t = static_cast<pid_t>(std::stoi(line.substr(5)));
+                    if (t > 0) return t;
+                } catch (...) {}
+                break;
+            }
+        }
+        return tid;
+    }
+
     ProcessState& get_or_create(pid_t pid, const VirtualCreds& default_creds) {
         auto it = procs_.find(pid);
         if (it != procs_.end()) return it->second;
         ProcessState st;
         st.pid = pid;
-        st.tgid = pid;
+        st.tgid = read_tgid_from_proc(pid);
         st.creds = default_creds;
         return procs_.emplace(pid, std::move(st)).first->second;
     }
 
-    void inherit_from_parent(pid_t parent_pid, pid_t child_pid) {
+    void inherit_from_parent(pid_t parent_pid, pid_t child_pid, bool is_thread = false) {
         auto it = procs_.find(parent_pid);
         ProcessState child;
         child.pid = child_pid;
-        child.tgid = child_pid;
         if (it != procs_.end()) {
             child.creds = it->second.creds;
+            child.tgid = is_thread ? it->second.tgid : read_tgid_from_proc(child_pid);
+        } else {
+            child.tgid = read_tgid_from_proc(child_pid);
         }
         procs_[child_pid] = std::move(child);
+    }
+
+    bool has_tgid(pid_t tgid) const noexcept {
+        for (const auto& kv : procs_) {
+            if (kv.second.tgid == tgid) return true;
+        }
+        return false;
     }
 
     void erase(pid_t pid) { procs_.erase(pid); }

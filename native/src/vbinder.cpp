@@ -133,13 +133,13 @@ bool VBinderBroker::is_watched_epfd(pid_t pid, int epfd) const {
     return epoll_watches_.find(fd_key(pid, epfd)) != epoll_watches_.end();
 }
 
-BinderIoctlResult VBinderBroker::handle_epoll_pwait(pid_t pid, int epfd,
+BinderIoctlResult VBinderBroker::handle_epoll_pwait(pid_t tgid, pid_t tid, int epfd,
                                                     uint64_t events_ptr, int maxevents) {
     BinderIoctlResult res;
-    auto it = epoll_watches_.find(fd_key(pid, epfd));
+    auto it = epoll_watches_.find(fd_key(tgid, epfd));
     if (it == epoll_watches_.end() || maxevents <= 0) return res;
 
-    ClientState* client = find_client(pid, it->second.binder_fd);
+    ClientState* client = find_client(tgid, it->second.binder_fd);
     if (!client) return res;
     res.handled = true;
 
@@ -147,19 +147,20 @@ BinderIoctlResult VBinderBroker::handle_epoll_pwait(pid_t pid, int epfd,
     ready_ev.events = EPOLLIN;
 
     if (!client->inbox.empty()) {
-        mem_ops_.write(pid, events_ptr, &ready_ev, sizeof(ready_ev));
+        mem_ops_.write(tid, events_ptr, &ready_ev, sizeof(ready_ev));
         res.return_value = 1;
         return res;
     }
 
-    // Park in epoll_pwait until a transaction arrives for this client
+    // Park calling thread in epoll_pwait until a transaction arrives for this process
     ParkedWaiter pw;
     pw.is_epoll = true;
-    pw.pid = pid;
+    pw.tgid = tgid;
+    pw.pid = tid;
     pw.fd = it->second.binder_fd;
     pw.epoll_events_ptr = events_ptr;
     pw.epoll_ev = ready_ev;
-    parked_[pid] = pw;
+    parked_[tid] = pw;
     res.park_caller = true;
     return res;
 }
@@ -228,7 +229,7 @@ void VBinderBroker::push_br_payload(ClientState& client, uint32_t br_code,
     client.inbox.push_back(std::move(ev));
 }
 
-bool VBinderBroker::flush_inbox_to_guest(ClientState& client, uint64_t bwr_addr,
+bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, uint64_t bwr_addr,
                                          binder::binder_write_read& bwr) {
     if (bwr.read_size == 0 || client.inbox.empty()) return false;
 
@@ -241,35 +242,36 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, uint64_t bwr_addr,
     }
     if (out.empty()) return false;
 
-    if (!mem_ops_.write(client.pid, bwr.read_buffer, out.data(), out.size())) {
+    if (!mem_ops_.write(target_tid, bwr.read_buffer, out.data(), out.size())) {
         return false;
     }
     bwr.read_consumed = out.size();
-    mem_ops_.write(client.pid, bwr_addr, &bwr, sizeof(bwr));
+    mem_ops_.write(target_tid, bwr_addr, &bwr, sizeof(bwr));
     return true;
 }
 
-void VBinderBroker::try_wake_parked(pid_t target_pid, std::vector<WakeEvent>& out_wakes) {
-    auto pit = parked_.find(target_pid);
-    if (pit == parked_.end()) return;
+void VBinderBroker::try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& out_wakes) {
+    for (auto pit = parked_.begin(); pit != parked_.end(); ++pit) {
+        if (pit->second.tgid != target_tgid) continue;
+        ParkedWaiter waiter = pit->second;
+        ClientState* client = find_client(waiter.tgid, waiter.fd);
+        if (!client) return;
 
-    ParkedWaiter waiter = pit->second;
-    ClientState* client = find_client(waiter.pid, waiter.fd);
-    if (!client) return;
+        if (waiter.is_epoll) {
+            if (!client->inbox.empty()) {
+                mem_ops_.write(waiter.pid, waiter.epoll_events_ptr,
+                               &waiter.epoll_ev, sizeof(waiter.epoll_ev));
+                parked_.erase(pit);
+                out_wakes.push_back(WakeEvent{waiter.pid, 1});
+            }
+            return;
+        }
 
-    if (waiter.is_epoll) {
-        if (!client->inbox.empty()) {
-            mem_ops_.write(waiter.pid, waiter.epoll_events_ptr,
-                           &waiter.epoll_ev, sizeof(waiter.epoll_ev));
+        if (flush_inbox_to_guest(*client, waiter.pid, waiter.bwr_addr, waiter.bwr)) {
             parked_.erase(pit);
-            out_wakes.push_back(WakeEvent{target_pid, 1});
+            out_wakes.push_back(WakeEvent{waiter.pid, 0});
         }
         return;
-    }
-
-    if (flush_inbox_to_guest(*client, waiter.bwr_addr, waiter.bwr)) {
-        parked_.erase(pit);
-        out_wakes.push_back(WakeEvent{target_pid, 0});
     }
 }
 
@@ -521,10 +523,10 @@ void VBinderBroker::process_write_buffer(DomainState& dom, ClientState& sender,
     }
 }
 
-BinderIoctlResult VBinderBroker::handle_ioctl(pid_t pid, int fd, unsigned long cmd,
+BinderIoctlResult VBinderBroker::handle_ioctl(pid_t tgid, pid_t tid, int fd, unsigned long cmd,
                                               uint64_t arg_ptr, uint32_t sender_euid) {
     BinderIoctlResult res;
-    ClientState* client = find_client(pid, fd);
+    ClientState* client = find_client(tgid, fd);
     if (!client) return res;
     res.handled = true;
     res.domain = client->domain;
@@ -534,14 +536,14 @@ BinderIoctlResult VBinderBroker::handle_ioctl(pid_t pid, int fd, unsigned long c
     switch (cmd) {
         case binder::kIoctlBinderVersion: {
             binder::binder_version ver { binder::kBinderCurrentProtocolVersion };
-            if (!mem_ops_.write(pid, arg_ptr, &ver, sizeof(ver))) {
+            if (!mem_ops_.write(tid, arg_ptr, &ver, sizeof(ver))) {
                 res.return_value = -EFAULT;
             }
             return res;
         }
         case binder::kIoctlBinderSetMaxThreads: {
             uint32_t max_t = 15;
-            if (mem_ops_.read(pid, arg_ptr, &max_t, sizeof(max_t))) {
+            if (mem_ops_.read(tid, arg_ptr, &max_t, sizeof(max_t))) {
                 client->max_threads = max_t;
             }
             return res;
@@ -552,29 +554,29 @@ BinderIoctlResult VBinderBroker::handle_ioctl(pid_t pid, int fd, unsigned long c
             return res;
 
         case binder::kIoctlBinderSetContextMgr: {
-            dom.context_mgr_pid = pid;
-            dom.context_mgr_node_id = get_or_create_node(dom, pid, 0, 0);
+            dom.context_mgr_pid = tgid;
+            dom.context_mgr_node_id = get_or_create_node(dom, tgid, 0, 0);
             res.became_context_mgr = true;
             return res;
         }
         case binder::kIoctlBinderSetContextMgrExt: {
             binder::flat_binder_object fbo {};
-            (void)mem_ops_.read(pid, arg_ptr, &fbo, sizeof(fbo));
-            dom.context_mgr_pid = pid;
-            dom.context_mgr_node_id = get_or_create_node(dom, pid, fbo.binder, fbo.cookie);
+            (void)mem_ops_.read(tid, arg_ptr, &fbo, sizeof(fbo));
+            dom.context_mgr_pid = tgid;
+            dom.context_mgr_node_id = get_or_create_node(dom, tgid, fbo.binder, fbo.cookie);
             res.became_context_mgr = true;
             return res;
         }
         case binder::kIoctlBinderWriteRead: {
             binder::binder_write_read bwr {};
-            if (!mem_ops_.read(pid, arg_ptr, &bwr, sizeof(bwr))) {
+            if (!mem_ops_.read(tid, arg_ptr, &bwr, sizeof(bwr))) {
                 res.return_value = -EFAULT;
                 return res;
             }
 
             if (bwr.write_size > 0) {
                 std::vector<uint8_t> wbuf(static_cast<size_t>(bwr.write_size));
-                if (!mem_ops_.read(pid, bwr.write_buffer, wbuf.data(), wbuf.size())) {
+                if (!mem_ops_.read(tid, bwr.write_buffer, wbuf.data(), wbuf.size())) {
                     res.return_value = -EFAULT;
                     return res;
                 }
@@ -583,20 +585,21 @@ BinderIoctlResult VBinderBroker::handle_ioctl(pid_t pid, int fd, unsigned long c
             }
 
             if (bwr.read_size > 0) {
-                if (!flush_inbox_to_guest(*client, arg_ptr, bwr)) {
-                    mem_ops_.write(pid, arg_ptr, &bwr, sizeof(bwr));
+                if (!flush_inbox_to_guest(*client, tid, arg_ptr, bwr)) {
+                    mem_ops_.write(tid, arg_ptr, &bwr, sizeof(bwr));
                     ParkedWaiter pw;
                     pw.is_epoll = false;
-                    pw.pid = pid;
+                    pw.tgid = tgid;
+                    pw.pid = tid;
                     pw.fd = fd;
                     pw.bwr_addr = arg_ptr;
                     pw.bwr = bwr;
-                    parked_[pid] = pw;
+                    parked_[tid] = pw;
                     res.park_caller = true;
                     return res;
                 }
             } else {
-                mem_ops_.write(pid, arg_ptr, &bwr, sizeof(bwr));
+                mem_ops_.write(tid, arg_ptr, &bwr, sizeof(bwr));
             }
             return res;
         }

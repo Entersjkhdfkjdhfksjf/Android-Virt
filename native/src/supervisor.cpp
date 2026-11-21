@@ -302,7 +302,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p6-sysserver-v2\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p6-sysserver-v3\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -476,10 +476,13 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
             if (pid == root_child) {
                 root_exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : (128 + WTERMSIG(status));
             }
-            vinput_.on_process_exit(pid);
-            auto wakes = vbinder_.on_process_exit(pid);
+            pid_t exiting_tgid = registry_.get_or_create(pid, cfg_.initial_creds).tgid;
             registry_.erase(pid);
-            wake_parked_binder_threads(wakes);
+            if (!registry_.has_tgid(exiting_tgid)) {
+                vinput_.on_process_exit(exiting_tgid);
+                auto wakes = vbinder_.on_process_exit(exiting_tgid);
+                wake_parked_binder_threads(wakes);
+            }
             continue;
         }
         if (!WIFSTOPPED(status)) continue;
@@ -508,7 +511,8 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
                     event == PTRACE_EVENT_CLONE)) {
             unsigned long new_pid = 0;
             if (::ptrace(PTRACE_GETEVENTMSG, pid, nullptr, &new_pid) == 0 && new_pid > 0) {
-                registry_.inherit_from_parent(pid, static_cast<pid_t>(new_pid));
+                registry_.inherit_from_parent(pid, static_cast<pid_t>(new_pid),
+                                              event == PTRACE_EVENT_CLONE);
             }
             ::ptrace(PTRACE_CONT, pid, nullptr, nullptr);
         } else if (sig == SIGTRAP && event == PTRACE_EVENT_EXEC) {
@@ -585,13 +589,13 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         int fd = static_cast<int>(regs.arg(0));
         unsigned long cmd = static_cast<unsigned long>(regs.arg(1));
         uint64_t arg_ptr = regs.arg(2);
-        if (vinput_.is_virtual_input_fd(pid, fd)) {
-            int64_t iret = vinput_.handle_ioctl(pid, fd, cmd, arg_ptr);
+        if (vinput_.is_virtual_input_fd(proc.tgid, fd)) {
+            int64_t iret = vinput_.handle_ioctl(proc.tgid, fd, cmd, arg_ptr);
             skip_with_ret(iret);
             return;
         }
-        if (vbinder_.is_virtual_binder_fd(pid, fd)) {
-            BinderIoctlResult bres = vbinder_.handle_ioctl(pid, fd, cmd, arg_ptr, proc.creds.euid);
+        if (vbinder_.is_virtual_binder_fd(proc.tgid, fd)) {
+            BinderIoctlResult bres = vbinder_.handle_ioctl(proc.tgid, pid, fd, cmd, arg_ptr, proc.creds.euid);
             if (bres.became_context_mgr && bres.domain == BinderDomain::kBinder) {
                 prop_service_.set("servicemanager.ready", "true");
                 if (cfg_.verbose) {
@@ -612,7 +616,7 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         int op = static_cast<int>(regs.arg(1));
         int target_fd = static_cast<int>(regs.arg(2));
         uint64_t ev_ptr = regs.arg(3);
-        if (vbinder_.handle_epoll_ctl(pid, epfd, op, target_fd, ev_ptr)) {
+        if (vbinder_.handle_epoll_ctl(proc.tgid, epfd, op, target_fd, ev_ptr)) {
             skip_with_ret(0);
             return;
         }
@@ -620,9 +624,9 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
     }
     if (nr == SYS_epoll_pwait) {
         int epfd = static_cast<int>(regs.arg(0));
-        if (vbinder_.is_watched_epfd(pid, epfd)) {
+        if (vbinder_.is_watched_epfd(proc.tgid, epfd)) {
             BinderIoctlResult eres = vbinder_.handle_epoll_pwait(
-                pid, epfd, regs.arg(1), static_cast<int>(regs.arg(2)));
+                proc.tgid, pid, epfd, regs.arg(1), static_cast<int>(regs.arg(2)));
             if (eres.park_caller) {
                 proc.parked_in_binder = true;
                 return;
@@ -1062,7 +1066,7 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
 
     if (op.kind == ExitPatchKind::kRegisterBinderFd) {
         int returned_fd = static_cast<int>(regs.ret());
-        vbinder_.register_client_fd(pid, returned_fd,
+        vbinder_.register_client_fd(proc.tgid, returned_fd,
                                     static_cast<BinderDomain>(op.binder_domain),
                                     op.binder_backing_path);
         return;
