@@ -702,6 +702,16 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         skip_with_ret(0);
         return;
     }
+    if (nr == SYS_prctl) {
+        int opt = static_cast<int>(regs.arg(0));
+        // Spoof capability bounding-set / ambient / keepcaps prctls inside Zygote SpecializeCommon()
+        if (opt == 24 /*PR_CAPBSET_DROP*/ || opt == 8 /*PR_SET_KEEPCAPS*/ ||
+            opt == 47 /*PR_CAP_AMBIENT*/) {
+            skip_with_ret(0);
+            return;
+        }
+        return;
+    }
     if (nr == SYS_setgroups || nr == SYS_capset || nr == SYS_fchownat || nr == SYS_fchown ||
         nr == SYS_mount || nr == SYS_umount2 || nr == SYS_chroot || nr == SYS_pivot_root ||
         nr == SYS_sethostname || nr == SYS_setdomainname || nr == SYS_unshare) {

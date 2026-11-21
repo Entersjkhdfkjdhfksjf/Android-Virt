@@ -79,6 +79,7 @@ std::vector<uint32_t> intercepted_syscalls() {
         SYS_fchmod,
         SYS_capget,
         SYS_capset,
+        SYS_prctl,
         // Mounts & namespaces
         SYS_mount,
         SYS_umount2,

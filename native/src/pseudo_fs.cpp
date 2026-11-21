@@ -133,7 +133,10 @@ std::string PseudoFs::generate_content(pid_t pid, std::string_view guest_path,
     if (starts_with(guest_path, "/sys/fs/selinux/class/")) {
         return "1\n";
     }
-    if (ends_with(guest_path, "/attr/current")) {
+    if (guest_path == "/sys/fs/selinux/access") {
+        return "ffffffff ffffffff ffffffff ffffffff 0 0\n";
+    }
+    if (ends_with(guest_path, "/attr/current") || ends_with(guest_path, "/attr/exec")) {
         std::string ctx = creds.selinux_ctx;
         ctx.push_back('\0');
         return ctx;

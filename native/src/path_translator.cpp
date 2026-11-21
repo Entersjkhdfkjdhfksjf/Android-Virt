@@ -31,7 +31,7 @@ bool is_virtual_proc_path(std::string_view p) {
         auto slash = rest.find('/');
         if (slash != std::string_view::npos && slash > 0) {
             auto tail = rest.substr(slash);
-            if (tail == "/attr/current" || tail == "/status" || tail == "/maps" ||
+            if (tail == "/attr/current" || tail == "/attr/exec" || tail == "/status" || tail == "/maps" ||
                 tail == "/mountinfo" || tail == "/mounts") {
                 return true;
             }
@@ -41,7 +41,7 @@ bool is_virtual_proc_path(std::string_view p) {
 }
 
 bool is_virtual_sys_path(std::string_view p) {
-    return p == "/sys/fs/selinux/enforce" || p == "/sys/fs/selinux/checkreqprot" || p == "/sys/fs/selinux/status" || starts_with(p, "/sys/fs/selinux/class/");
+    return p == "/sys/fs/selinux/enforce" || p == "/sys/fs/selinux/checkreqprot" || p == "/sys/fs/selinux/status" || starts_with(p, "/sys/fs/selinux/class/") || p == "/sys/fs/selinux/access";
 }
 
 bool is_virtual_binder_path(std::string_view p) {
