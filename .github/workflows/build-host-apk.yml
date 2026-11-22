@@ -68,11 +68,36 @@ jobs:
           if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
             NDK_PATH=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)
           fi
-          git clone --branch android-12.1.0_r27 --depth 1             https://android.googlesource.com/platform/external/swiftshader swiftshader-src
-          cmake -S swiftshader-src -B swiftshader-build             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=arm64-v8a             -DANDROID_PLATFORM=android-31             -DCMAKE_BUILD_TYPE=Release             -DSWIFTSHADER_BUILD_EGL=ON             -DSWIFTSHADER_BUILD_GLESv2=ON             -DSWIFTSHADER_BUILD_GLES_CM=ON             -DSWIFTSHADER_BUILD_VULKAN=OFF             -DSWIFTSHADER_BUILD_TESTS=OFF             -DSWIFTSHADER_BUILD_SAMPLES=OFF             -DREACTOR_BACKEND=LLVM \
+          git clone --branch android-12.1.0_r27 --depth 1 \
+            https://android.googlesource.com/platform/external/swiftshader swiftshader-src
+          git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/system/core aosp-core && \
+            git -C aosp-core sparse-checkout set libcutils/include libsystem/include libsync/include
+          git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/system/logging aosp-logging && \
+            git -C aosp-logging sparse-checkout set liblog/include
+          git clone --branch android-12.1.0_r27 --depth 1 \
+            https://android.googlesource.com/platform/hardware/libhardware aosp-hw
+          git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/frameworks/native aosp-native && \
+            git -C aosp-native sparse-checkout set libs/nativebase/include libs/arect/include
+          AOSP_INCS="-isystem ${PWD}/aosp-core/libcutils/include -isystem ${PWD}/aosp-core/libsystem/include -isystem ${PWD}/aosp-core/libsync/include -isystem ${PWD}/aosp-logging/liblog/include -isystem ${PWD}/aosp-hw/include -isystem ${PWD}/aosp-native/libs/nativebase/include -isystem ${PWD}/aosp-native/libs/arect/include"
+          cmake -S swiftshader-src -B swiftshader-build \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-31 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSWIFTSHADER_BUILD_EGL=ON \
+            -DSWIFTSHADER_BUILD_GLESv2=ON \
+            -DSWIFTSHADER_BUILD_GLES_CM=ON \
+            -DSWIFTSHADER_BUILD_VULKAN=OFF \
+            -DSWIFTSHADER_BUILD_TESTS=OFF \
+            -DSWIFTSHADER_BUILD_SAMPLES=OFF \
+            -DREACTOR_BACKEND=LLVM \
             -DSWIFTSHADER_WARNINGS_AS_ERRORS=OFF \
-            -DCMAKE_CXX_FLAGS="-Wno-error -Wno-unused-but-set-variable -Wno-deprecated-declarations" \
-            -DCMAKE_C_FLAGS="-Wno-error"
+            -DCMAKE_CXX_FLAGS="${AOSP_INCS} -Wno-error -Wno-unused-but-set-variable -Wno-deprecated-declarations" \
+            -DCMAKE_C_FLAGS="${AOSP_INCS} -Wno-error" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-shlib-undefined"
           cmake --build swiftshader-build --target libEGL libGLESv2 libGLESv1_CM -j$(nproc)
           mkdir -p swiftshader-out
           STRIP="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
