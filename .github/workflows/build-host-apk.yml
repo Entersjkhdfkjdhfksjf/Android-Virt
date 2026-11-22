@@ -105,11 +105,11 @@ jobs:
             -DCMAKE_SHARED_LINKER_FLAGS="-landroid -llog -Wl,--allow-shlib-undefined -Wl,--unresolved-symbols=ignore-all"
           # Compile gl_main first (~5s) to verify Android headers before the 12-min LLVM build
           cmake --build swiftshader-build --target gl_main -j$(nproc)
-          cmake --build swiftshader-build --target libEGL libGLESv2 libGLESv1_CM -j$(nproc)
+          cmake --build swiftshader-build --target libEGL libGLESv2 libGLES_CM -j$(nproc)
           mkdir -p swiftshader-out
           STRIP="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           cp $(find swiftshader-build -maxdepth 3 -name "libEGL*.so" | head -n 1) swiftshader-out/libEGL_swiftshader.so
-          cp $(find swiftshader-build -maxdepth 3 -name "libGLESv1_CM*.so" | head -n 1) swiftshader-out/libGLESv1_CM_swiftshader.so
+          cp $(find swiftshader-build -maxdepth 3 -name "libGLES*CM*.so" | head -n 1) swiftshader-out/libGLESv1_CM_swiftshader.so
           cp $(find swiftshader-build -maxdepth 3 -name "libGLESv2*.so" | head -n 1) swiftshader-out/libGLESv2_swiftshader.so
           "$STRIP" --strip-unneeded swiftshader-out/*.so
 
