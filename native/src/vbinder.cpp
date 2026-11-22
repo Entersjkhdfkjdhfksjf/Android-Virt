@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstddef>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -226,12 +227,14 @@ void VBinderBroker::push_br_code(ClientState& client, uint32_t br_code, pid_t ta
 
 void VBinderBroker::push_br_payload(ClientState& client, uint32_t br_code,
                                     const void* payload, size_t len,
-                                    pid_t target_tid, ReplyTarget reply_to) {
+                                    pid_t target_tid, ReplyTarget reply_to,
+                                    std::vector<PendingFdPatch> fd_patches) {
     PendingBrEvent ev;
     ev.bytes.resize(4 + len);
     std::memcpy(ev.bytes.data(), &br_code, 4);
     if (len > 0) std::memcpy(ev.bytes.data() + 4, payload, len);
     ev.reply_to = reply_to;
+    ev.fd_patches = std::move(fd_patches);
     if (target_tid != 0) {
         client.thread_inboxes[target_tid].push_back(std::move(ev));
     } else {
@@ -244,22 +247,35 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
     if (bwr.read_size == 0) return false;
 
     std::vector<uint8_t> out;
+    auto apply_fd_patches = [&](const PendingBrEvent& ev) {
+        if (ev.fd_patches.empty() || !client.rx_map || !mem_ops_.dup_fd_into_target) return;
+        for (const auto& fp : ev.fd_patches) {
+            int new_fd = mem_ops_.dup_fd_into_target(fp.sender_tgid, fp.sender_fd, target_tid);
+            if (new_fd >= 0 && fp.target_rx_off + sizeof(uint32_t) <= kRxRingSize) {
+                uint32_t ufd = static_cast<uint32_t>(new_fd);
+                std::memcpy(client.rx_map + fp.target_rx_off, &ufd, sizeof(ufd));
+            }
+        }
+    };
+
     auto& tq = client.thread_inboxes[target_tid];
     while (!tq.empty()) {
         const auto& ev = tq.front();
         if (out.size() + ev.bytes.size() > bwr.read_size) break;
+        apply_fd_patches(ev);
         out.insert(out.end(), ev.bytes.begin(), ev.bytes.end());
         tq.pop_front();
     }
 
     // Only pull process-wide transactions/refcounts if this thread isn't actively blocked
-    // waiting for a synchronous BR_REPLY (or if we have room and want to deliver).
+    // waiting for a synchronous BR_REPLY.
     auto wit = client.waiting_reply_depth.find(target_tid);
     bool is_waiting_reply = (wit != client.waiting_reply_depth.end() && wit->second > 0);
     if (!is_waiting_reply) {
         while (!client.inbox.empty()) {
             const auto& ev = client.inbox.front();
             if (out.size() + ev.bytes.size() > bwr.read_size) break;
+            apply_fd_patches(ev);
             if (ev.reply_to.tgid != 0) {
                 client.thread_reply_stacks[target_tid].push_back(ev.reply_to);
             }
@@ -405,6 +421,7 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     std::vector<uint64_t> sg_guest_addrs(num_offs, 0);
     std::vector<size_t> sg_ring_offs(num_offs, 0);
     std::vector<binder::binder_ptr_cookie> pending_node_refs;
+    std::vector<std::pair<size_t, int>> raw_fd_patches;
     constexpr uint32_t kBinderBufferFlagHasParent = 0x01;
 
     for (size_t i = 0; i < num_offs; ++i) {
@@ -440,6 +457,14 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
                 std::memcpy(target.rx_map + sg_ring_offs[bbo->parent] + bbo->parent_offset,
                             &child_guest_ptr, sizeof(child_guest_ptr));
             }
+            continue;
+        }
+
+        if (obj_type == binder::kBinderTypeFd) {
+            if (obj_off + sizeof(binder::binder_fd_object) > payload.size()) continue;
+            const auto* fdo = reinterpret_cast<const binder::binder_fd_object*>(payload.data() + obj_off);
+            size_t fd_field_off = static_cast<size_t>(obj_off) + offsetof(binder::binder_fd_object, fd);
+            raw_fd_patches.emplace_back(fd_field_off, static_cast<int>(fdo->fd));
             continue;
         }
 
@@ -517,19 +542,27 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     out_tr.data.ptr.buffer = guest_payload_ptr;
     out_tr.data.ptr.offsets = guest_offsets_ptr;
 
+    std::vector<PendingFdPatch> fd_patches;
+    fd_patches.reserve(raw_fd_patches.size());
+    for (const auto& rf : raw_fd_patches) {
+        fd_patches.push_back(PendingFdPatch{sender.pid, rf.second, payload_ring_off + rf.first});
+    }
+
     if (is_reply) {
         auto wit = target.waiting_reply_depth.find(target_reply_tid);
         if (wit != target.waiting_reply_depth.end() && wit->second > 0) {
             wit->second--;
         }
-        push_br_payload(target, binder::kBrReply, &out_tr, sizeof(out_tr), target_reply_tid);
+        push_br_payload(target, binder::kBrReply, &out_tr, sizeof(out_tr), target_reply_tid,
+                        ReplyTarget{0, 0}, std::move(fd_patches));
     } else {
         ReplyTarget rt {};
         if ((tr.flags & binder::kTfOneWay) == 0) {
             sender.waiting_reply_depth[sender_tid]++;
             rt = ReplyTarget{sender.pid, sender_tid};
         }
-        push_br_payload(target, binder::kBrTransaction, &out_tr, sizeof(out_tr), 0, rt);
+        push_br_payload(target, binder::kBrTransaction, &out_tr, sizeof(out_tr), 0, rt,
+                        std::move(fd_patches));
     }
 
     for (const auto& pc : pending_node_refs) {
@@ -630,7 +663,21 @@ void VBinderBroker::process_write_buffer(DomainState& dom, ClientState& sender,
                 binder::binder_handle_cookie hc {};
                 std::memcpy(&hc, wbuf.data() + pos, sizeof(hc));
                 pos += sizeof(hc);
-                push_br_payload(sender, binder::kBrClearDeathNotifDone, &hc.cookie, sizeof(hc.cookie));
+                uint64_t node_id = 0;
+                if (hc.handle == 0) node_id = dom.context_mgr_node_id;
+                else if (auto it = sender.handle_to_node.find(hc.handle); it != sender.handle_to_node.end()) {
+                    node_id = it->second;
+                }
+                dom.death_subs.erase(
+                    std::remove_if(dom.death_subs.begin(), dom.death_subs.end(),
+                                   [&](const DeathSubscription& s) {
+                                       return s.watcher_pid == sender.pid &&
+                                              (node_id == 0 || s.node_id == node_id) &&
+                                              s.cookie == hc.cookie;
+                                   }),
+                    dom.death_subs.end());
+                push_br_payload(sender, binder::kBrClearDeathNotifDone, &hc.cookie, sizeof(hc.cookie),
+                                sender_tid);
                 break;
             }
             case binder::kBcDeadBinderDone: {

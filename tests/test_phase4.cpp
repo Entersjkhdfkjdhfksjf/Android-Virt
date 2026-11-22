@@ -204,7 +204,72 @@ int main() {
     ::munmap(hw_rx, VBinderBroker::kRxRingSize);
     fs::remove_all(tmp);
 
-    std::cout << "[PASS] VBinderBroker 3-domain isolation, handle translation, sync RPC & death recipients\n";
+    // 8. Test BINDER_TYPE_FD cross-process FD patching
+    int dup_calls = 0;
+    GuestMemOps fd_ops = ops;
+    fd_ops.dup_fd_into_target = [&](pid_t stgid, int sfd, pid_t ttid) -> int {
+        if (stgid == 201 && sfd == 42 && ttid == 200) {
+            dup_calls++;
+            return 99;
+        }
+        return -1;
+    };
+    std::string fd_tmp = "/tmp/vguest_p4_fd_test";
+    fs::remove_all(fd_tmp);
+    fs::create_directories(fd_tmp);
+    VBinderBroker fd_broker(fd_tmp, fd_ops);
+    std::string f_sm = fd_broker.prepare_open_backing_file(200, BinderDomain::kBinder);
+    int fd_sm_b = ::open(f_sm.c_str(), O_RDONLY);
+    void* fd_sm_rx = ::mmap(nullptr, VBinderBroker::kRxRingSize, PROT_READ, MAP_SHARED, fd_sm_b, 0);
+    ::close(fd_sm_b);
+    fd_broker.register_client_fd(200, 3, BinderDomain::kBinder, f_sm,
+                                 reinterpret_cast<uint64_t>(fd_sm_rx));
+
+    std::string f_cl = fd_broker.prepare_open_backing_file(201, BinderDomain::kBinder);
+    int fd_cl_b = ::open(f_cl.c_str(), O_RDONLY);
+    void* fd_cl_rx = ::mmap(nullptr, VBinderBroker::kRxRingSize, PROT_READ, MAP_SHARED, fd_cl_b, 0);
+    ::close(fd_cl_b);
+    fd_broker.register_client_fd(201, 3, BinderDomain::kBinder, f_cl,
+                                 reinterpret_cast<uint64_t>(fd_cl_rx));
+    assert(fd_broker.handle_ioctl(200, 3, kIoctlBinderSetContextMgr, 0, 0).handled);
+
+    struct PayloadWithFd {
+        binder_fd_object fdo;
+    } fd_payload {};
+    fd_payload.fdo.hdr.type = kBinderTypeFd;
+    fd_payload.fdo.fd = 42;
+    binder_size_t fd_off = 0;
+    struct { uint32_t cmd; binder_transaction_data tr; } __attribute__((packed)) ftx {};
+    ftx.cmd = kBcTransaction;
+    ftx.tr.target.handle = 0;
+    ftx.tr.code = 77;
+    ftx.tr.flags = kTfOneWay;
+    ftx.tr.data_size = sizeof(fd_payload);
+    ftx.tr.offsets_size = sizeof(fd_off);
+    ftx.tr.data.ptr.buffer = reinterpret_cast<uint64_t>(&fd_payload);
+    ftx.tr.data.ptr.offsets = reinterpret_cast<uint64_t>(&fd_off);
+    binder_write_read fbwr {};
+    fbwr.write_size = sizeof(ftx);
+    fbwr.write_buffer = reinterpret_cast<uint64_t>(&ftx);
+    assert(fd_broker.handle_ioctl(201, 3, kIoctlBinderWriteRead,
+                                  reinterpret_cast<uint64_t>(&fbwr), 1000).handled);
+
+    uint8_t sm_fd_rbuf[256] {};
+    binder_write_read sm_fd_bwr {};
+    sm_fd_bwr.read_size = sizeof(sm_fd_rbuf);
+    sm_fd_bwr.read_buffer = reinterpret_cast<uint64_t>(sm_fd_rbuf);
+    assert(fd_broker.handle_ioctl(200, 3, kIoctlBinderWriteRead,
+                                  reinterpret_cast<uint64_t>(&sm_fd_bwr), 0).handled);
+    binder_transaction_data sm_fd_tr {};
+    std::memcpy(&sm_fd_tr, sm_fd_rbuf + 4, sizeof(sm_fd_tr));
+    const auto* rx_fdo = reinterpret_cast<const binder_fd_object*>(sm_fd_tr.data.ptr.buffer);
+    assert(dup_calls == 1);
+    assert(rx_fdo->fd == 99);
+    ::munmap(fd_sm_rx, VBinderBroker::kRxRingSize);
+    ::munmap(fd_cl_rx, VBinderBroker::kRxRingSize);
+    fs::remove_all(fd_tmp);
+
+    std::cout << "[PASS] VBinderBroker 3-domain isolation, handle translation, BINDER_TYPE_FD, sync RPC & death recipients\n";
     std::cout << "[ALL PHASE 4 UNIT TESTS PASSED]\n";
     return 0;
 }

@@ -23,6 +23,7 @@ struct GuestMemOps {
     std::function<bool(pid_t, uint64_t, void*, size_t)> read;
     std::function<bool(pid_t, uint64_t, const void*, size_t)> write;
     std::function<uint64_t(pid_t, const std::string&)> find_mmap_base;
+    std::function<int(pid_t, int, pid_t)> dup_fd_into_target;
 };
 
 struct WakeEvent {
@@ -104,9 +105,16 @@ private:
         pid_t tid = 0;
     };
 
+    struct PendingFdPatch {
+        pid_t sender_tgid = 0;
+        int sender_fd = -1;
+        size_t target_rx_off = 0;
+    };
+
     struct PendingBrEvent {
         std::vector<uint8_t> bytes;
         ReplyTarget reply_to {};
+        std::vector<PendingFdPatch> fd_patches;
     };
 
     struct ParkedWaiter {
@@ -161,7 +169,8 @@ private:
 
     void push_br_code(ClientState& client, uint32_t br_code, pid_t target_tid = 0);
     void push_br_payload(ClientState& client, uint32_t br_code, const void* payload, size_t len,
-                         pid_t target_tid = 0, ReplyTarget reply_to = ReplyTarget{0, 0});
+                         pid_t target_tid = 0, ReplyTarget reply_to = ReplyTarget{0, 0},
+                         std::vector<PendingFdPatch> fd_patches = {});
     bool flush_inbox_to_guest(ClientState& client, pid_t target_tid, uint64_t bwr_addr,
                               binder::binder_write_read& bwr);
     void try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& out_wakes);

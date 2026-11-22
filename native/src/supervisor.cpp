@@ -153,6 +153,7 @@ Supervisor::Supervisor(SupervisorConfig cfg)
                    [this](pid_t p, uint64_t a, void* o, size_t l) { return read_guest_mem(p, a, o, l); },
                    [this](pid_t p, uint64_t a, const void* d, size_t l) { return write_guest_mem(p, a, d, l); },
                    [](pid_t p, const std::string& sub) { return find_guest_mmap_base(p, sub); },
+                   [this](pid_t stgid, int sfd, pid_t ttid) { return dup_fd_into_target(stgid, sfd, ttid); },
                }),
       vinput_(cfg_.rootfs_root, 1400, 876,
               InputMemOps{[this](pid_t p, uint64_t a, const void* d, size_t l) {
@@ -175,6 +176,69 @@ uint64_t Supervisor::find_guest_mmap_base(pid_t pid, const std::string& path_sub
         }
     }
     return 0;
+}
+
+int Supervisor::dup_fd_into_target(pid_t sender_tgid, int sender_fd, pid_t target_tid) const {
+    if (sender_tgid <= 0 || sender_fd < 0 || target_tid <= 0) return -1;
+    ArchRegs saved;
+    if (!saved.load(target_tid)) return -1;
+
+    std::string proc_path = "/proc/" + std::to_string(static_cast<int>(sender_tgid)) +
+                            "/fd/" + std::to_string(sender_fd);
+    proc_path.push_back('\0');
+    uint64_t scratch = scratch_addr_below_sp(saved.sp(), proc_path.size());
+    if (!write_guest_mem(target_tid, scratch, proc_path.data(), proc_path.size())) {
+        return -1;
+    }
+
+    auto run_openat = [&](int flags, bool rewind_pc) -> int {
+        ArchRegs inj = saved;
+#if defined(__aarch64__)
+        if (rewind_pc) inj.r.pc -= 4;
+#elif defined(__x86_64__)
+        if (rewind_pc) inj.r.rip -= 2;
+#endif
+        inj.set_arg(0, static_cast<uint64_t>(AT_FDCWD));
+        inj.set_arg(1, scratch);
+        inj.set_arg(2, static_cast<uint64_t>(flags));
+        inj.set_arg(3, 0);
+        inj.store(target_tid);
+#if defined(__aarch64__)
+        int nr = SYS_openat;
+        struct iovec iov { &nr, sizeof(nr) };
+        ::ptrace(PTRACE_SETREGSET, target_tid, reinterpret_cast<void*>(NT_ARM_SYSTEM_CALL), &iov);
+#elif defined(__x86_64__)
+        inj.r.orig_rax = SYS_openat;
+        inj.store(target_tid);
+#endif
+        ::ptrace(PTRACE_SYSCALL, target_tid, nullptr, nullptr);
+        int st = 0;
+        while (::waitpid(target_tid, &st, __WALL) > 0) {
+            if (!WIFSTOPPED(st)) return -1;
+            int s = WSTOPSIG(st);
+            if (s == (SIGTRAP | 0x80)) {
+                ArchRegs out;
+                if (!out.load(target_tid)) return -1;
+                if (rewind_pc) {
+                    // Rewound call stops at syscall entry first, then syscall exit
+                    rewind_pc = false;
+                    ::ptrace(PTRACE_SYSCALL, target_tid, nullptr, nullptr);
+                    continue;
+                }
+                return static_cast<int>(out.ret());
+            }
+            ::ptrace(PTRACE_SYSCALL, target_tid, nullptr, nullptr);
+        }
+        return -1;
+    };
+
+    int new_fd = run_openat(O_RDWR | O_CLOEXEC, false);
+    if (new_fd == -EACCES || new_fd == -EROFS) {
+        new_fd = run_openat(O_RDONLY | O_CLOEXEC, true);
+    }
+
+    saved.store(target_tid);
+    return (new_fd >= 0) ? new_fd : -1;
 }
 
 bool Supervisor::read_guest_mem(pid_t pid, uint64_t addr, void* out, size_t len) const {
@@ -302,7 +366,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p6-sysserver-v7\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7a-binder-fd\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());

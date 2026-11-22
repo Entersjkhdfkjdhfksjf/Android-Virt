@@ -44,6 +44,7 @@ private:
     bool write_guest_mem(pid_t pid, uint64_t addr, const void* data, size_t len) const;
     bool read_guest_cstring(pid_t pid, uint64_t addr, std::string& out, size_t max_len = 4096) const;
     static uint64_t find_guest_mmap_base(pid_t pid, const std::string& path_substr);
+    int dup_fd_into_target(pid_t sender_tgid, int sender_fd, pid_t target_tid) const;
     static std::string read_elf_interp(const std::string& host_binary_path);
 
     SupervisorConfig cfg_;
