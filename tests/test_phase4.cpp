@@ -108,8 +108,17 @@ int main() {
     assert(r_tx.wakes.size() == 1 && r_tx.wakes[0].pid == 200);
 
     // Verify client got BR_TRANSACTION_COMPLETE
+    size_t cl_off = 0;
     uint32_t cl_br = 0;
-    std::memcpy(&cl_br, cl_rbuf, 4);
+    while (cl_off + 4 <= cl_bwr.read_consumed) {
+        std::memcpy(&cl_br, cl_rbuf + cl_off, 4);
+        cl_off += 4;
+        if (cl_br == kBrIncrefs || cl_br == kBrAcquire) {
+            cl_off += sizeof(binder_ptr_cookie);
+            continue;
+        }
+        break;
+    }
     assert(cl_br == kBrTransactionComplete);
 
     // Verify servicemanager got BR_TRANSACTION with translated BINDER_TYPE_HANDLE

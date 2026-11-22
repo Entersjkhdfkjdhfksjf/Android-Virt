@@ -532,11 +532,11 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
         push_br_payload(target, binder::kBrTransaction, &out_tr, sizeof(out_tr), 0, rt);
     }
 
-    push_br_code(sender, binder::kBrTransactionComplete, sender_tid);
     for (const auto& pc : pending_node_refs) {
         push_br_payload(sender, binder::kBrIncrefs, &pc, sizeof(pc), sender_tid);
         push_br_payload(sender, binder::kBrAcquire, &pc, sizeof(pc), sender_tid);
     }
+    push_br_code(sender, binder::kBrTransactionComplete, sender_tid);
     if (is_reply && target_reply_tid != 0) {
         try_wake_parked_tid(target_reply_tid, out_wakes);
     } else {
