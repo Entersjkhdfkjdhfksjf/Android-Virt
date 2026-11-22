@@ -399,11 +399,25 @@ class MainActivity : AppCompatActivity() {
         runGuestShell("/vendor/bin/vguest_fb_demo", showDisplay = true)
     }
 
+    private fun syncVendorEglLibs() {
+        val eglDir = File(rootfsDir, "vendor/lib64/egl")
+        eglDir.mkdirs()
+        for (name in listOf("libEGL_swiftshader.so", "libGLESv1_CM_swiftshader.so", "libGLESv2_swiftshader.so")) {
+            val src = File(applicationInfo.nativeLibraryDir, name)
+            val dst = File(eglDir, name)
+            if (src.exists() && (!dst.exists() || dst.length() != src.length())) {
+                src.copyTo(dst, overwrite = true)
+                runCatching { Os.chmod(dst.absolutePath, 0x1ED) }
+            }
+        }
+    }
+
     private fun runBootStage(stage: String) {
         if (!runnerBin.exists() || !File(rootfsDir, "system/bin/sh").exists()) {
             appendLog("[ERROR] Rootfs or runner missing.")
             return
         }
+        syncVendorEglLibs()
         setBusy(true)
         runOnUiThread { displayContainer.visibility = View.GONE }
         appendLog("\n=== Launching Phase 6 Boot Stage: $stage ===")
@@ -445,6 +459,7 @@ class MainActivity : AppCompatActivity() {
             appendLog("[ERROR] Rootfs not imported yet. Tap 'Import' first.")
             return
         }
+        syncVendorEglLibs()
 
         setBusy(true)
         runOnUiThread {
