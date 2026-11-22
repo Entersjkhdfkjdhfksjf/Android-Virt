@@ -59,7 +59,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: swiftshader-out
-          key: swiftshader-gles-arm64-v8a-android12-r1
+          key: swiftshader-gles-arm64-v8a-llvm-r1
 
       - name: Build SwiftShader OpenGL ES (arm64-v8a)
         if: steps.cache-swiftshader.outputs.cache-hit != 'true'
@@ -69,7 +69,7 @@ jobs:
             NDK_PATH=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)
           fi
           git clone --branch android-12.1.0_r27 --depth 1             https://android.googlesource.com/platform/external/swiftshader swiftshader-src
-          cmake -S swiftshader-src -B swiftshader-build             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=arm64-v8a             -DANDROID_PLATFORM=android-31             -DCMAKE_BUILD_TYPE=Release             -DSWIFTSHADER_BUILD_EGL=ON             -DSWIFTSHADER_BUILD_GLESv2=ON             -DSWIFTSHADER_BUILD_GLES_CM=ON             -DSWIFTSHADER_BUILD_VULKAN=OFF             -DSWIFTSHADER_BUILD_TESTS=OFF             -DSWIFTSHADER_BUILD_SAMPLES=OFF             -DREACTOR_BACKEND=Subzero
+          cmake -S swiftshader-src -B swiftshader-build             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake"             -DANDROID_ABI=arm64-v8a             -DANDROID_PLATFORM=android-31             -DCMAKE_BUILD_TYPE=Release             -DSWIFTSHADER_BUILD_EGL=ON             -DSWIFTSHADER_BUILD_GLESv2=ON             -DSWIFTSHADER_BUILD_GLES_CM=ON             -DSWIFTSHADER_BUILD_VULKAN=OFF             -DSWIFTSHADER_BUILD_TESTS=OFF             -DSWIFTSHADER_BUILD_SAMPLES=OFF             -DREACTOR_BACKEND=LLVM
           cmake --build swiftshader-build --target libEGL libGLESv2 libGLESv1_CM -j$(nproc)
           mkdir -p swiftshader-out
           STRIP="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
