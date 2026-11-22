@@ -85,11 +85,10 @@ jobs:
           echo '=== Discovered AOSP headers ==='
           find aosp-core aosp-logging aosp-hw aosp-native -name 'native_handle.h' -o -name 'window.h' -o -name 'gralloc.h' | head -n 20
           AOSP_INC_DIRS=$(find "${PWD}/aosp-core" "${PWD}/aosp-logging" "${PWD}/aosp-hw" "${PWD}/aosp-native" -maxdepth 4 -type d -name 'include*' | tr '\n' ' ')
-          echo "include_directories(SYSTEM ${AOSP_INC_DIRS})" > swiftshader-aosp-inc.cmake
-          cat swiftshader-src/CMakeLists.txt >> swiftshader-aosp-inc.cmake
-          mv swiftshader-aosp-inc.cmake swiftshader-src/CMakeLists.txt
+          echo "include_directories(SYSTEM ${AOSP_INC_DIRS})" > "${PWD}/swiftshader-aosp-inc.cmake"
 
           cmake -S swiftshader-src -B swiftshader-build \
+            -DCMAKE_PROJECT_INCLUDE="${PWD}/swiftshader-aosp-inc.cmake" \
             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-31 \
