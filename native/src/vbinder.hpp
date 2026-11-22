@@ -99,8 +99,14 @@ private:
         uint64_t cookie = 0;
     };
 
+    struct ReplyTarget {
+        pid_t tgid = 0;
+        pid_t tid = 0;
+    };
+
     struct PendingBrEvent {
         std::vector<uint8_t> bytes;
+        ReplyTarget reply_to {};
     };
 
     struct ParkedWaiter {
@@ -133,7 +139,9 @@ private:
         std::unordered_map<uint32_t, uint64_t> handle_to_node;
         std::unordered_map<uint64_t, uint32_t> node_to_handle;
         std::deque<PendingBrEvent> inbox;
-        std::deque<pid_t> reply_stack;
+        std::unordered_map<pid_t, std::deque<PendingBrEvent>> thread_inboxes;
+        std::unordered_map<pid_t, std::deque<ReplyTarget>> thread_reply_stacks;
+        std::unordered_map<pid_t, int> waiting_reply_depth;
     };
 
     struct DomainState {
@@ -151,16 +159,20 @@ private:
     uint64_t get_or_create_node(DomainState& dom, pid_t owner_pid, uint64_t ptr, uint64_t cookie);
     uint32_t get_or_create_handle(ClientState& client, uint64_t node_id);
 
-    void push_br_code(ClientState& client, uint32_t br_code);
-    void push_br_payload(ClientState& client, uint32_t br_code, const void* payload, size_t len);
+    void push_br_code(ClientState& client, uint32_t br_code, pid_t target_tid = 0);
+    void push_br_payload(ClientState& client, uint32_t br_code, const void* payload, size_t len,
+                         pid_t target_tid = 0, ReplyTarget reply_to = ReplyTarget{0, 0});
     bool flush_inbox_to_guest(ClientState& client, pid_t target_tid, uint64_t bwr_addr,
                               binder::binder_write_read& bwr);
     void try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& out_wakes);
+    void try_wake_parked_tid(pid_t target_tid, std::vector<WakeEvent>& out_wakes);
 
-    void process_write_buffer(DomainState& dom, ClientState& sender, uint32_t sender_euid,
+    void process_write_buffer(DomainState& dom, ClientState& sender, pid_t sender_tid,
+                              uint32_t sender_euid,
                               const std::vector<uint8_t>& wbuf,
                               std::vector<WakeEvent>& out_wakes);
-    void dispatch_transaction(DomainState& dom, ClientState& sender, uint32_t sender_euid,
+    void dispatch_transaction(DomainState& dom, ClientState& sender, pid_t sender_tid,
+                              uint32_t sender_euid,
                               const binder::binder_transaction_data& tr, bool is_reply,
                               std::vector<WakeEvent>& out_wakes);
 

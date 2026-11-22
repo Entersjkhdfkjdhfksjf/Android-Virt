@@ -213,33 +213,61 @@ uint32_t VBinderBroker::get_or_create_handle(ClientState& client, uint64_t node_
     return h;
 }
 
-void VBinderBroker::push_br_code(ClientState& client, uint32_t br_code) {
+void VBinderBroker::push_br_code(ClientState& client, uint32_t br_code, pid_t target_tid) {
     PendingBrEvent ev;
     ev.bytes.resize(4);
     std::memcpy(ev.bytes.data(), &br_code, 4);
-    client.inbox.push_back(std::move(ev));
+    if (target_tid != 0) {
+        client.thread_inboxes[target_tid].push_back(std::move(ev));
+    } else {
+        client.inbox.push_back(std::move(ev));
+    }
 }
 
 void VBinderBroker::push_br_payload(ClientState& client, uint32_t br_code,
-                                    const void* payload, size_t len) {
+                                    const void* payload, size_t len,
+                                    pid_t target_tid, ReplyTarget reply_to) {
     PendingBrEvent ev;
     ev.bytes.resize(4 + len);
     std::memcpy(ev.bytes.data(), &br_code, 4);
     if (len > 0) std::memcpy(ev.bytes.data() + 4, payload, len);
-    client.inbox.push_back(std::move(ev));
+    ev.reply_to = reply_to;
+    if (target_tid != 0) {
+        client.thread_inboxes[target_tid].push_back(std::move(ev));
+    } else {
+        client.inbox.push_back(std::move(ev));
+    }
 }
 
 bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, uint64_t bwr_addr,
                                          binder::binder_write_read& bwr) {
-    if (bwr.read_size == 0 || client.inbox.empty()) return false;
+    if (bwr.read_size == 0) return false;
 
     std::vector<uint8_t> out;
-    while (!client.inbox.empty()) {
-        const auto& ev = client.inbox.front();
+    auto& tq = client.thread_inboxes[target_tid];
+    while (!tq.empty()) {
+        const auto& ev = tq.front();
         if (out.size() + ev.bytes.size() > bwr.read_size) break;
         out.insert(out.end(), ev.bytes.begin(), ev.bytes.end());
-        client.inbox.pop_front();
+        tq.pop_front();
     }
+
+    // Only pull process-wide transactions/refcounts if this thread isn't actively blocked
+    // waiting for a synchronous BR_REPLY (or if we have room and want to deliver).
+    auto wit = client.waiting_reply_depth.find(target_tid);
+    bool is_waiting_reply = (wit != client.waiting_reply_depth.end() && wit->second > 0);
+    if (!is_waiting_reply) {
+        while (!client.inbox.empty()) {
+            const auto& ev = client.inbox.front();
+            if (out.size() + ev.bytes.size() > bwr.read_size) break;
+            if (ev.reply_to.tgid != 0) {
+                client.thread_reply_stacks[target_tid].push_back(ev.reply_to);
+            }
+            out.insert(out.end(), ev.bytes.begin(), ev.bytes.end());
+            client.inbox.pop_front();
+        }
+    }
+
     if (out.empty()) return false;
 
     if (!mem_ops_.write(target_tid, bwr.read_buffer, out.data(), out.size())) {
@@ -250,47 +278,83 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
     return true;
 }
 
-void VBinderBroker::try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& out_wakes) {
-    for (auto pit = parked_.begin(); pit != parked_.end(); ++pit) {
-        if (pit->second.tgid != target_tgid) continue;
-        ParkedWaiter waiter = pit->second;
-        ClientState* client = find_client(waiter.tgid, waiter.fd);
-        if (!client) return;
+void VBinderBroker::try_wake_parked_tid(pid_t target_tid, std::vector<WakeEvent>& out_wakes) {
+    auto pit = parked_.find(target_tid);
+    if (pit == parked_.end()) return;
 
-        if (waiter.is_epoll) {
-            if (!client->inbox.empty()) {
-                mem_ops_.write(waiter.pid, waiter.epoll_events_ptr,
-                               &waiter.epoll_ev, sizeof(waiter.epoll_ev));
+    ParkedWaiter waiter = pit->second;
+    ClientState* client = find_client(waiter.tgid, waiter.fd);
+    if (!client) return;
+
+    if (waiter.is_epoll) {
+        if (!client->inbox.empty() || !client->thread_inboxes[waiter.pid].empty()) {
+            mem_ops_.write(waiter.pid, waiter.epoll_events_ptr,
+                           &waiter.epoll_ev, sizeof(waiter.epoll_ev));
+            parked_.erase(pit);
+            out_wakes.push_back(WakeEvent{waiter.pid, 1});
+        }
+        return;
+    }
+
+    if (flush_inbox_to_guest(*client, waiter.pid, waiter.bwr_addr, waiter.bwr)) {
+        parked_.erase(pit);
+        out_wakes.push_back(WakeEvent{waiter.pid, 0});
+    }
+}
+
+void VBinderBroker::try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& out_wakes) {
+    // Prefer a parked thread that is NOT waiting for a synchronous reply
+    for (int pass = 0; pass < 2; ++pass) {
+        for (auto pit = parked_.begin(); pit != parked_.end(); ++pit) {
+            if (pit->second.tgid != target_tgid) continue;
+            ParkedWaiter waiter = pit->second;
+            ClientState* client = find_client(waiter.tgid, waiter.fd);
+            if (!client) return;
+
+            auto wit = client->waiting_reply_depth.find(waiter.pid);
+            bool is_waiting = (wit != client->waiting_reply_depth.end() && wit->second > 0);
+            if (pass == 0 && is_waiting) continue;
+
+            if (waiter.is_epoll) {
+                if (!client->inbox.empty() || !client->thread_inboxes[waiter.pid].empty()) {
+                    mem_ops_.write(waiter.pid, waiter.epoll_events_ptr,
+                                   &waiter.epoll_ev, sizeof(waiter.epoll_ev));
+                    parked_.erase(pit);
+                    out_wakes.push_back(WakeEvent{waiter.pid, 1});
+                }
+                return;
+            }
+
+            if (flush_inbox_to_guest(*client, waiter.pid, waiter.bwr_addr, waiter.bwr)) {
                 parked_.erase(pit);
-                out_wakes.push_back(WakeEvent{waiter.pid, 1});
+                out_wakes.push_back(WakeEvent{waiter.pid, 0});
             }
             return;
         }
-
-        if (flush_inbox_to_guest(*client, waiter.pid, waiter.bwr_addr, waiter.bwr)) {
-            parked_.erase(pit);
-            out_wakes.push_back(WakeEvent{waiter.pid, 0});
-        }
-        return;
     }
 }
 
 void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
+                                         pid_t sender_tid,
                                          uint32_t sender_euid,
                                          const binder::binder_transaction_data& tr,
                                          bool is_reply,
                                          std::vector<WakeEvent>& out_wakes) {
     pid_t target_pid = 0;
+    pid_t target_reply_tid = 0;
     uint64_t target_ptr = 0;
     uint64_t target_cookie = 0;
 
     if (is_reply) {
-        if (sender.reply_stack.empty()) {
-            push_br_code(sender, binder::kBrFailedReply);
+        auto& rstack = sender.thread_reply_stacks[sender_tid];
+        if (rstack.empty()) {
+            push_br_code(sender, binder::kBrFailedReply, sender_tid);
             return;
         }
-        target_pid = sender.reply_stack.back();
-        sender.reply_stack.pop_back();
+        ReplyTarget rt = rstack.back();
+        rstack.pop_back();
+        target_pid = rt.tgid;
+        target_reply_tid = rt.tid;
     } else {
         uint32_t handle = tr.target.handle;
         if (handle == 0) {
@@ -318,7 +382,7 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     auto tit = dom.clients.find(target_pid);
     if (target_pid == 0 || tit == dom.clients.end() || !tit->second.rx_map ||
         !ensure_mmap_base(tit->second)) {
-        push_br_code(sender, binder::kBrDeadReply);
+        push_br_code(sender, binder::kBrDeadReply, sender_tid);
         return;
     }
 
@@ -327,13 +391,13 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     std::vector<uint8_t> payload(static_cast<size_t>(tr.data_size));
     if (tr.data_size > 0 &&
         !mem_ops_.read(sender.pid, tr.data.ptr.buffer, payload.data(), payload.size())) {
-        push_br_code(sender, binder::kBrFailedReply);
+        push_br_code(sender, binder::kBrFailedReply, sender_tid);
         return;
     }
     std::vector<uint8_t> offsets(static_cast<size_t>(tr.offsets_size));
     if (tr.offsets_size > 0 &&
         !mem_ops_.read(sender.pid, tr.data.ptr.offsets, offsets.data(), offsets.size())) {
-        push_br_code(sender, binder::kBrFailedReply);
+        push_br_code(sender, binder::kBrFailedReply, sender_tid);
         return;
     }
 
@@ -358,12 +422,12 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
             size_t alloc_len = static_cast<size_t>(bbo->length);
             uint64_t child_guest_ptr = alloc_rx_space(target, std::max<size_t>(alloc_len, 8), child_ring_off);
             if (child_guest_ptr == 0) {
-                push_br_code(sender, binder::kBrFailedReply);
+                push_br_code(sender, binder::kBrFailedReply, sender_tid);
                 return;
             }
             if (alloc_len > 0 && bbo->buffer != 0) {
                 if (!mem_ops_.read(sender.pid, bbo->buffer, target.rx_map + child_ring_off, alloc_len)) {
-                    push_br_code(sender, binder::kBrFailedReply);
+                    push_br_code(sender, binder::kBrFailedReply, sender_tid);
                     return;
                 }
             }
@@ -427,7 +491,7 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     if (!payload.empty()) {
         guest_payload_ptr = alloc_rx_space(target, payload.size(), payload_ring_off);
         if (guest_payload_ptr == 0) {
-            push_br_code(sender, binder::kBrFailedReply);
+            push_br_code(sender, binder::kBrFailedReply, sender_tid);
             return;
         }
         std::memcpy(target.rx_map + payload_ring_off, payload.data(), payload.size());
@@ -435,7 +499,7 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     if (!offsets.empty()) {
         guest_offsets_ptr = alloc_rx_space(target, offsets.size(), offsets_ring_off);
         if (guest_offsets_ptr == 0) {
-            push_br_code(sender, binder::kBrFailedReply);
+            push_br_code(sender, binder::kBrFailedReply, sender_tid);
             return;
         }
         std::memcpy(target.rx_map + offsets_ring_off, offsets.data(), offsets.size());
@@ -454,23 +518,34 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     out_tr.data.ptr.offsets = guest_offsets_ptr;
 
     if (is_reply) {
-        push_br_payload(target, binder::kBrReply, &out_tr, sizeof(out_tr));
-    } else {
-        if ((tr.flags & binder::kTfOneWay) == 0) {
-            target.reply_stack.push_back(sender.pid);
+        auto wit = target.waiting_reply_depth.find(target_reply_tid);
+        if (wit != target.waiting_reply_depth.end() && wit->second > 0) {
+            wit->second--;
         }
-        push_br_payload(target, binder::kBrTransaction, &out_tr, sizeof(out_tr));
+        push_br_payload(target, binder::kBrReply, &out_tr, sizeof(out_tr), target_reply_tid);
+    } else {
+        ReplyTarget rt {};
+        if ((tr.flags & binder::kTfOneWay) == 0) {
+            sender.waiting_reply_depth[sender_tid]++;
+            rt = ReplyTarget{sender.pid, sender_tid};
+        }
+        push_br_payload(target, binder::kBrTransaction, &out_tr, sizeof(out_tr), 0, rt);
     }
 
-    push_br_code(sender, binder::kBrTransactionComplete);
+    push_br_code(sender, binder::kBrTransactionComplete, sender_tid);
     for (const auto& pc : pending_node_refs) {
-        push_br_payload(sender, binder::kBrIncrefs, &pc, sizeof(pc));
-        push_br_payload(sender, binder::kBrAcquire, &pc, sizeof(pc));
+        push_br_payload(sender, binder::kBrIncrefs, &pc, sizeof(pc), sender_tid);
+        push_br_payload(sender, binder::kBrAcquire, &pc, sizeof(pc), sender_tid);
     }
-    try_wake_parked(target.pid, out_wakes);
+    if (is_reply && target_reply_tid != 0) {
+        try_wake_parked_tid(target_reply_tid, out_wakes);
+    } else {
+        try_wake_parked(target.pid, out_wakes);
+    }
 }
 
 void VBinderBroker::process_write_buffer(DomainState& dom, ClientState& sender,
+                                         pid_t sender_tid,
                                          uint32_t sender_euid,
                                          const std::vector<uint8_t>& wbuf,
                                          std::vector<WakeEvent>& out_wakes) {
@@ -487,7 +562,7 @@ void VBinderBroker::process_write_buffer(DomainState& dom, ClientState& sender,
                 binder::binder_transaction_data tr {};
                 std::memcpy(&tr, wbuf.data() + pos, sizeof(tr));
                 pos += sizeof(tr);
-                dispatch_transaction(dom, sender, sender_euid, tr, cmd == binder::kBcReply, out_wakes);
+                dispatch_transaction(dom, sender, sender_tid, sender_euid, tr, cmd == binder::kBcReply, out_wakes);
                 break;
             }
             case binder::kBcTransactionSg:
@@ -496,7 +571,7 @@ void VBinderBroker::process_write_buffer(DomainState& dom, ClientState& sender,
                 binder::binder_transaction_data_sg tr_sg {};
                 std::memcpy(&tr_sg, wbuf.data() + pos, sizeof(tr_sg));
                 pos += sizeof(tr_sg);
-                dispatch_transaction(dom, sender, sender_euid, tr_sg.transaction_data,
+                dispatch_transaction(dom, sender, sender_tid, sender_euid, tr_sg.transaction_data,
                                      cmd == binder::kBcReplySg, out_wakes);
                 break;
             }
@@ -626,7 +701,7 @@ BinderIoctlResult VBinderBroker::handle_ioctl(pid_t tgid, pid_t tid, int fd, uns
                     res.return_value = -EFAULT;
                     return res;
                 }
-                process_write_buffer(dom, *client, sender_euid, wbuf, res.wakes);
+                process_write_buffer(dom, *client, tid, sender_euid, wbuf, res.wakes);
                 bwr.write_consumed = bwr.write_size;
             }
 
