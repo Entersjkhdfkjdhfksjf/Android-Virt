@@ -141,6 +141,15 @@ std::string PseudoFs::generate_content(pid_t pid, std::string_view guest_path,
     if (guest_path == "/sys/fs/selinux/context") {
         return "0\n";
     }
+    if (guest_path == "/sys/power/wake_lock" || guest_path == "/sys/power/wake_unlock") {
+        return "\n";
+    }
+    if (guest_path == "/sys/power/state") {
+        return "freeze mem\n";
+    }
+    if (guest_path == "/sys/power/wakeup_count") {
+        return "0\n";
+    }
     if (ends_with(guest_path, "/attr/current") || ends_with(guest_path, "/attr/exec") ||
         ends_with(guest_path, "/attr/prev") || ends_with(guest_path, "/attr/fscreate") ||
         ends_with(guest_path, "/attr/sockcreate") || ends_with(guest_path, "/attr/keycreate")) {

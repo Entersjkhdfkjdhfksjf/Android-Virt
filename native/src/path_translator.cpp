@@ -50,7 +50,9 @@ bool is_virtual_proc_path(std::string_view p) {
 bool is_virtual_sys_path(std::string_view p) {
     return p == "/sys/fs/selinux/enforce" || p == "/sys/fs/selinux/checkreqprot" ||
            p == "/sys/fs/selinux/status" || p == "/sys/fs/selinux/access" ||
-           p == "/sys/fs/selinux/context";
+           p == "/sys/fs/selinux/context" ||
+           p == "/sys/power/wake_lock" || p == "/sys/power/wake_unlock" ||
+           p == "/sys/power/state" || p == "/sys/power/wakeup_count";
 }
 
 bool is_virtual_binder_path(std::string_view p) {
