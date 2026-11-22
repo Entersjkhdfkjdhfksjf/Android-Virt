@@ -72,16 +72,23 @@ jobs:
             https://android.googlesource.com/platform/external/swiftshader swiftshader-src
           git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
             https://android.googlesource.com/platform/system/core aosp-core && \
-            git -C aosp-core sparse-checkout set libcutils/include libsystem/include libsync/include
+            git -C aosp-core sparse-checkout set libcutils libsystem libsync include
           git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
             https://android.googlesource.com/platform/system/logging aosp-logging && \
-            git -C aosp-logging sparse-checkout set liblog/include
+            git -C aosp-logging sparse-checkout set liblog
           git clone --branch android-12.1.0_r27 --depth 1 \
             https://android.googlesource.com/platform/hardware/libhardware aosp-hw
           git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
             https://android.googlesource.com/platform/frameworks/native aosp-native && \
-            git -C aosp-native sparse-checkout set libs/nativebase/include libs/arect/include
-          AOSP_INCS="-isystem ${PWD}/aosp-core/libcutils/include -isystem ${PWD}/aosp-core/libsystem/include -isystem ${PWD}/aosp-core/libsync/include -isystem ${PWD}/aosp-logging/liblog/include -isystem ${PWD}/aosp-hw/include -isystem ${PWD}/aosp-native/libs/nativebase/include -isystem ${PWD}/aosp-native/libs/arect/include"
+            git -C aosp-native sparse-checkout set libs/nativewindow libs/nativebase libs/arect libs/ui include
+
+          echo '=== Discovered AOSP headers ==='
+          find aosp-core aosp-logging aosp-hw aosp-native -name 'native_handle.h' -o -name 'window.h' -o -name 'gralloc.h' | head -n 20
+          AOSP_INC_DIRS=$(find "${PWD}/aosp-core" "${PWD}/aosp-logging" "${PWD}/aosp-hw" "${PWD}/aosp-native" -maxdepth 4 -type d -name 'include*' | tr '\n' ' ')
+          echo "include_directories(SYSTEM ${AOSP_INC_DIRS})" > swiftshader-aosp-inc.cmake
+          cat swiftshader-src/CMakeLists.txt >> swiftshader-aosp-inc.cmake
+          mv swiftshader-aosp-inc.cmake swiftshader-src/CMakeLists.txt
+
           cmake -S swiftshader-src -B swiftshader-build \
             -DCMAKE_TOOLCHAIN_FILE="${NDK_PATH}/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
@@ -92,12 +99,13 @@ jobs:
             -DSWIFTSHADER_BUILD_GLES_CM=ON \
             -DSWIFTSHADER_BUILD_VULKAN=OFF \
             -DSWIFTSHADER_BUILD_TESTS=OFF \
-            -DSWIFTSHADER_BUILD_SAMPLES=OFF \
             -DREACTOR_BACKEND=LLVM \
             -DSWIFTSHADER_WARNINGS_AS_ERRORS=OFF \
-            -DCMAKE_CXX_FLAGS="${AOSP_INCS} -Wno-error -Wno-unused-but-set-variable -Wno-deprecated-declarations" \
-            -DCMAKE_C_FLAGS="${AOSP_INCS} -Wno-error" \
+            -DCMAKE_CXX_FLAGS="-Wno-error -Wno-unused-but-set-variable -Wno-deprecated-declarations" \
+            -DCMAKE_C_FLAGS="-Wno-error" \
             -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-shlib-undefined"
+          # Compile gl_main first (~5s) to verify Android headers before the 12-min LLVM build
+          cmake --build swiftshader-build --target gl_main -j$(nproc)
           cmake --build swiftshader-build --target libEGL libGLESv2 libGLESv1_CM -j$(nproc)
           mkdir -p swiftshader-out
           STRIP="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
