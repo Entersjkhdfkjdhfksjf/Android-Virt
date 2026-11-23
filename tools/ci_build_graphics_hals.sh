@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Cross-compiles AOSP 12 Graphics HALs (arm64-v8a) on GitHub Actions (ubuntu-latest):
-#   1. libvguest_hwcomposer.so     -> /vendor/lib64/hw/hwcomposer.{virt,default}.so
-#   2. libvguest_mapper20_impl.so  -> /vendor/lib64/hw/android.hardware.graphics.mapper@2.0-impl.so
+#   1. libvguest_hwcomposer.so      -> /vendor/lib64/hw/hwcomposer.{virt,default}.so
+#   2. libvguest_mapper20_impl.so   -> /vendor/lib64/hw/android.hardware.graphics.mapper@2.0-impl.so
 #   3. libvguest_allocator20_svc.so -> /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service
 #   4. libvguest_composer21_svc.so  -> /vendor/bin/hw/android.hardware.graphics.composer@2.1-service
 
@@ -71,8 +71,8 @@ using YYLTYPE = yy::parser::location_type;
 EOF
 fi
 cp hidl-gen_y.h hidl-gen_y.hh
-flex -o hidl-gen_l.raw.cpp --header-file=hidl-gen_l.h "${WORK}/hidl-tools/hidl-gen_l.ll"
-{ echo '#include "hidl-gen_y.h"'; cat hidl-gen_l.raw.cpp; } > hidl-gen_l.cpp
+# Let hidl-gen_l.ll include AST.h first, then hidl-gen_y.h (which now defines YYSTYPE/YYLTYPE)
+flex -o hidl-gen_l.cpp --header-file=hidl-gen_l.h "${WORK}/hidl-tools/hidl-gen_l.ll"
 
 # Collect only POSIX libbase sources needed on Ubuntu host
 LIBBASE_SRCS=""
@@ -94,7 +94,6 @@ for sub in utils host_utils hashing; do
   fi
 done
 
-# Discover all include dirs inside hidl-tools (including hidl-util / hidl-hash subdirs)
 HIDL_INCS=""
 for d in $(find "${WORK}/hidl-tools" -maxdepth 4 -type d \( -name 'include*' -o -name 'hidl-util' -o -name 'hidl-hash' \)); do
   HIDL_INCS="${HIDL_INCS} -I${d}"
@@ -128,7 +127,10 @@ HIDL_ROOTS="-r android.hardware:${WORK}/hw-if -r android.hidl:${WORK}/libhidl/tr
 for pkg in \
   android.hidl.base@1.0 \
   android.hidl.manager@1.0 \
+  android.hidl.memory@1.0 \
   android.hardware.graphics.common@1.0 \
+  android.hardware.graphics.common@1.1 \
+  android.hardware.graphics.common@1.2 \
   android.hardware.graphics.allocator@2.0 \
   android.hardware.graphics.mapper@2.0 \
   android.hardware.graphics.composer@2.1; do
@@ -155,6 +157,8 @@ for lib in \
   android.hidl.base@1.0.so \
   android.hidl.manager@1.0.so \
   android.hardware.graphics.common@1.0.so \
+  android.hardware.graphics.common@1.1.so \
+  android.hardware.graphics.common@1.2.so \
   android.hardware.graphics.allocator@2.0.so \
   android.hardware.graphics.mapper@2.0.so \
   android.hardware.graphics.composer@2.1.so; do
@@ -224,23 +228,50 @@ MAPPER_SRCS=$(find "${WORK}/hw-if/graphics/mapper/2.0/default" -name '*.cpp')
   -landroid.hardware.graphics.common@1.0 \
   -o "${OUT}/libvguest_mapper20_impl.so"
 
-# 3. AOSP 12 IAllocator@2.0 binderized service (wraps gralloc.virt.so)
-ALLOC_SRCS=$(find "${WORK}/hw-if/graphics/allocator/2.0/default" -name '*.cpp')
+# 3. Self-contained AOSP 12 IAllocator@2.0 binderized service (calls GrallocLoader::load() directly)
+cat > "${WORK}/allocator_service_main.cpp" <<'EOF'
+#include <allocator-passthrough/2.0/GrallocLoader.h>
+#include <android/hardware/graphics/allocator/2.0/IAllocator.h>
+#include <hidl/HidlTransportSupport.h>
+#include <log/log.h>
+
+using android::sp;
+using android::hardware::configureRpcThreadpool;
+using android::hardware::joinRpcThreadpool;
+using android::hardware::graphics::allocator::V2_0::IAllocator;
+using android::hardware::graphics::allocator::V2_0::passthrough::GrallocLoader;
+
+int main() {
+    configureRpcThreadpool(4, true /* callerWillJoin */);
+    sp<IAllocator> allocator(GrallocLoader::load());
+    if (!allocator) {
+        ALOGE("VGuest allocator@2.0: GrallocLoader::load() failed");
+        return 1;
+    }
+    if (allocator->registerAsService() != android::OK) {
+        ALOGE("VGuest allocator@2.0: registerAsService() failed");
+        return 1;
+    }
+    ALOGI("VGuest allocator@2.0: registered IAllocator/default");
+    joinRpcThreadpool();
+    return 0;
+}
+EOF
+
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -fPIE -pie \
-  ${ALLOC_SRCS} \
+  "${WORK}/allocator_service_main.cpp" \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lhardware -lutils -lcutils -llog -lbase -lc++ \
   -landroid.hardware.graphics.allocator@2.0 \
   -landroid.hardware.graphics.common@1.0 \
   -o "${OUT}/libvguest_allocator20_svc.so"
 
-# 4. AOSP 12 IComposer@2.1 binderized service (wraps hwcomposer.virt.so)
+# 4. Self-contained AOSP 12 IComposer@2.1 binderized service (calls HwcLoader::load() directly)
 COMP_SRCS=$(find \
   "${WORK}/hw-if/graphics/composer/2.1/default" \
-  "${WORK}/hw-if/graphics/composer/2.1/utils/passthrough" \
   "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2on1adapter" \
   "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2onfbadapter" \
-  -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp')
+  -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name 'passthrough.cpp')
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -fPIE -pie \
   ${COMP_SRCS} \
   "${LINK_FLAGS[@]}" \
