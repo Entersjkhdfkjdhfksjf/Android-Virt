@@ -238,8 +238,8 @@ MAPPER_SRCS=$(find "${WORK}/hw-if/graphics/mapper/2.0/default" -name '*.cpp')
   ${MAPPER_SRCS} \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lhardware -lutils -lcutils -llog -lsync -lc++ \
-  -landroid.hardware.graphics.mapper@2.0 \
-  -landroid.hardware.graphics.common@1.0 \
+  "${STUBS}/android.hardware.graphics.mapper@2.0.so" \
+  "${STUBS}/android.hardware.graphics.common@1.0.so" \
   -o "${OUT}/libvguest_mapper20_impl.so"
 
 # 3. Self-contained AOSP 12 IAllocator@2.0 binderized service (calls GrallocLoader::load() directly)
@@ -276,8 +276,8 @@ EOF
   "${WORK}/allocator_service_main.cpp" \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lhardware -lutils -lcutils -llog -lbase -lc++ \
-  -landroid.hardware.graphics.allocator@2.0 \
-  -landroid.hardware.graphics.common@1.0 \
+  "${STUBS}/android.hardware.graphics.allocator@2.0.so" \
+  "${STUBS}/android.hardware.graphics.common@1.0.so" \
   -o "${OUT}/libvguest_allocator20_svc.so"
 
 # 4. Self-contained AOSP 12 IComposer@2.1 binderized service (calls HwcLoader::load() directly)
@@ -292,8 +292,8 @@ COMP_SRCS=$(find \
   ${COMP_SRCS} \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lfmq -lhardware -lutils -lcutils -llog -lbase -lsync -lc++ \
-  -landroid.hardware.graphics.composer@2.1 \
-  -landroid.hardware.graphics.common@1.0 \
+  "${STUBS}/android.hardware.graphics.composer@2.1.so" \
+  "${STUBS}/android.hardware.graphics.common@1.0.so" \
   -o "${OUT}/libvguest_composer21_svc.so"
 
 "${STRIP}" --strip-unneeded "${OUT}"/*.so
