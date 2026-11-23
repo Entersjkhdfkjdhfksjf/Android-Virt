@@ -22,9 +22,9 @@ CC_ARM64="${TOOLCHAIN}/aarch64-linux-android31-clang"
 STRIP="${TOOLCHAIN}/llvm-strip"
 READELF="${TOOLCHAIN}/llvm-readelf"
 
-echo "=== [1/5] Installing host build deps (bison, flex, libssl-dev) ==="
+echo "=== [1/5] Installing host build deps (bison, flex, libssl-dev, libjsoncpp-dev) ==="
 sudo apt-get update -qq
-sudo apt-get install -y -qq bison flex libssl-dev
+sudo apt-get install -y -qq bison flex libssl-dev libjsoncpp-dev
 
 echo "=== [2/5] Cloning AOSP android-12.1.0_r27 HIDL & Graphics HAL repos ==="
 cd "${WORK}"
@@ -44,6 +44,7 @@ clone_sparse() {
 [ -d libhardware ]|| git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/hardware/libhardware libhardware
 [ -d libfmq ]     || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libfmq libfmq
 [ -d libhidl ]    || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libhidl libhidl
+[ -d libhwbinder ]|| git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libhwbinder libhwbinder
 clone_sparse https://android.googlesource.com/platform/system/core core libcutils libutils libsystem libsync include
 clone_sparse https://android.googlesource.com/platform/frameworks/native native libs/nativewindow libs/nativebase libs/arect libs/ui include
 clone_sparse https://android.googlesource.com/platform/hardware/interfaces hw-if graphics/common graphics/allocator/2.0 graphics/mapper/2.0 graphics/composer/2.1
@@ -52,7 +53,24 @@ echo "=== [3/5] Building host hidl-gen ==="
 mkdir -p "${WORK}/hidl-gen-build"
 cd "${WORK}/hidl-gen-build"
 
+cat > host_compat.h <<'EOF'
+#pragma once
+#include <cstdint>
+#include <cstring>
+#include <algorithm>
+EOF
+
 bison -d -o hidl-gen_y.cpp --defines=hidl-gen_y.h "${WORK}/hidl-tools/hidl-gen_y.yy"
+if ! grep -q "YYSTYPE" hidl-gen_y.h; then
+  cat >> hidl-gen_y.h <<'EOF'
+#ifndef YYSTYPE
+#define YYSTYPE yy::parser::semantic_type
+#endif
+#ifndef YYLTYPE
+#define YYLTYPE yy::parser::location_type
+#endif
+EOF
+fi
 cp hidl-gen_y.h hidl-gen_y.hh
 flex -o hidl-gen_l.cpp --header-file=hidl-gen_l.h "${WORK}/hidl-tools/hidl-gen_l.ll"
 
@@ -66,7 +84,7 @@ for f in file.cpp logging.cpp mapped_file.cpp parsebool.cpp parsenetaddress.cpp 
   fi
 done
 
-# Collect only hidl-gen core + utils + host_utils + hashing (exclude hidl2aidl, metadata, c2hal, lint, tests)
+# Collect only hidl-gen core + utils + host_utils + hashing
 HIDL_SRCS=$(find \
   "${WORK}/hidl-tools" \
   -maxdepth 1 -name '*.cpp' ! -name '*_test.cpp' ! -name '*fuzz*' ! -name '*Fuzz*')
@@ -85,14 +103,19 @@ done
 g++ -std=c++17 -O2 -w \
   -D_GNU_SOURCE \
   -D'__builtin_available(...)=0' \
+  -include "${WORK}/hidl-gen-build/host_compat.h" \
   -I"${WORK}/hidl-gen-build" \
   -I"${WORK}/hidl-tools" \
   ${HIDL_INCS} \
   -I"${WORK}/libbase/include" \
   -I"${WORK}/logging/liblog/include" \
+  -I"${WORK}/libhwbinder/include" \
+  -I"${WORK}/libhidl/base/include" \
   -I"${WORK}/core/include" \
+  -I"${WORK}/core/libutils/include" \
+  -I/usr/include/jsoncpp \
   hidl-gen_y.cpp hidl-gen_l.cpp ${HIDL_SRCS} ${LIBBASE_SRCS} \
-  -lcrypto -lpthread \
+  -lcrypto -ljsoncpp -lpthread \
   -o "${WORK}/hidl-gen"
 
 "${WORK}/hidl-gen" --version || true
@@ -142,6 +165,7 @@ AOSP_INCS=(
   -I"${GEN}"
   -I"${REPO_ROOT}/include"
   -I"${WORK}/libhardware/include"
+  -I"${WORK}/libhwbinder/include"
   -I"${WORK}/libhidl/base/include"
   -I"${WORK}/libhidl/transport/include"
   -I"${WORK}/libhidl/libhidlmemory/include"
