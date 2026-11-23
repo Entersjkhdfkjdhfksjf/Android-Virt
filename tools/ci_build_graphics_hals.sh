@@ -282,6 +282,7 @@ EOF
 
 # 4. Self-contained AOSP 12 IComposer@2.1 binderized service (calls HwcLoader::load() directly, no vndbinder dep)
 cat > "${WORK}/composer_service_main.cpp" <<'EOF'
+#define LOG_TAG "VGuestComposer"
 #include <android/hardware/graphics/composer/2.1/IComposer.h>
 #include <composer-passthrough/2.1/HwcLoader.h>
 #include <hidl/HidlTransportSupport.h>
@@ -310,17 +311,17 @@ int main() {
 }
 EOF
 
-COMP_SRCS=$(find \
-  "${WORK}/hw-if/graphics/composer/2.1/utils/passthrough" \
-  "${WORK}/hw-if/graphics/composer/2.1/utils/hal" \
-  "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2on1adapter" \
-  "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2onfbadapter" \
-  -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' 2>/dev/null || true)
-"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -fPIE -pie \
+COMP_INCS=""
+for d in $(find "${WORK}/hw-if/graphics/composer/2.1/utils" -maxdepth 3 -type d -name 'include*'); do
+  COMP_INCS="${COMP_INCS} -I${d}"
+done
+COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' ! -name '*Fuzz*')
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" ${COMP_INCS} -DLOG_TAG='"VGuestComposer"' -DPAGE_SIZE=4096 -fPIE -pie \
   "${WORK}/composer_service_main.cpp" ${COMP_SRCS} \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lfmq -lhardware -lutils -lcutils -llog -lbase -lsync -lc++ \
   "${STUBS}/android.hardware.graphics.composer@2.1.so" \
+  "${STUBS}/android.hardware.graphics.mapper@2.0.so" \
   "${STUBS}/android.hardware.graphics.common@1.0.so" \
   -o "${OUT}/libvguest_composer21_svc.so"
 
