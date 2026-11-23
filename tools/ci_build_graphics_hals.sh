@@ -60,6 +60,20 @@ cat > host_compat.h <<'EOF'
 #include <algorithm>
 EOF
 
+cat > host_log_stub.cpp <<'EOF'
+#include <cstdarg>
+#include <cstdio>
+extern "C" int __android_log_buf_print(int, int, const char* tag, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    if (tag) std::fprintf(stderr, "[%s] ", tag);
+    int r = std::vfprintf(stderr, fmt, ap);
+    std::fputc('\n', stderr);
+    va_end(ap);
+    return r;
+}
+EOF
+
 bison -d -o hidl-gen_y.cpp --defines=hidl-gen_y.h "${WORK}/hidl-tools/hidl-gen_y.yy"
 if grep -q "semantic_type" hidl-gen_y.h; then
   cat >> hidl-gen_y.h <<'EOF'
@@ -113,7 +127,7 @@ g++ -std=c++17 -O2 -w \
   -I"${WORK}/core/include" \
   -I"${WORK}/core/libutils/include" \
   -I/usr/include/jsoncpp \
-  hidl-gen_y.cpp hidl-gen_l.cpp ${HIDL_SRCS} ${LIBBASE_SRCS} \
+  hidl-gen_y.cpp hidl-gen_l.cpp host_log_stub.cpp ${HIDL_SRCS} ${LIBBASE_SRCS} \
   -lcrypto -ljsoncpp -lpthread \
   -o "${WORK}/hidl-gen"
 
@@ -269,9 +283,11 @@ EOF
 # 4. Self-contained AOSP 12 IComposer@2.1 binderized service (calls HwcLoader::load() directly)
 COMP_SRCS=$(find \
   "${WORK}/hw-if/graphics/composer/2.1/default" \
+  "${WORK}/hw-if/graphics/composer/2.1/utils/passthrough" \
+  "${WORK}/hw-if/graphics/composer/2.1/utils/hal" \
   "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2on1adapter" \
   "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2onfbadapter" \
-  -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name 'passthrough.cpp')
+  -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' ! -name 'passthrough.cpp' 2>/dev/null || true)
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -fPIE -pie \
   ${COMP_SRCS} \
   "${LINK_FLAGS[@]}" \
