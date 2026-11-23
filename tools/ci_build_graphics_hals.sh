@@ -61,18 +61,18 @@ cat > host_compat.h <<'EOF'
 EOF
 
 bison -d -o hidl-gen_y.cpp --defines=hidl-gen_y.h "${WORK}/hidl-tools/hidl-gen_y.yy"
-if ! grep -q "YYSTYPE" hidl-gen_y.h; then
+if grep -q "semantic_type" hidl-gen_y.h; then
   cat >> hidl-gen_y.h <<'EOF'
-#ifndef YYSTYPE
-#define YYSTYPE yy::parser::semantic_type
-#endif
-#ifndef YYLTYPE
-#define YYLTYPE yy::parser::location_type
+#ifndef VGUEST_BISON_YYSTYPE_ALIAS
+#define VGUEST_BISON_YYSTYPE_ALIAS
+using YYSTYPE = yy::parser::semantic_type;
+using YYLTYPE = yy::parser::location_type;
 #endif
 EOF
 fi
 cp hidl-gen_y.h hidl-gen_y.hh
-flex -o hidl-gen_l.cpp --header-file=hidl-gen_l.h "${WORK}/hidl-tools/hidl-gen_l.ll"
+flex -o hidl-gen_l.raw.cpp --header-file=hidl-gen_l.h "${WORK}/hidl-tools/hidl-gen_l.ll"
+{ echo '#include "hidl-gen_y.h"'; cat hidl-gen_l.raw.cpp; } > hidl-gen_l.cpp
 
 # Collect only POSIX libbase sources needed on Ubuntu host
 LIBBASE_SRCS=""
