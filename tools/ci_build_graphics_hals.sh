@@ -280,16 +280,44 @@ EOF
   "${STUBS}/android.hardware.graphics.common@1.0.so" \
   -o "${OUT}/libvguest_allocator20_svc.so"
 
-# 4. Self-contained AOSP 12 IComposer@2.1 binderized service (calls HwcLoader::load() directly)
+# 4. Self-contained AOSP 12 IComposer@2.1 binderized service (calls HwcLoader::load() directly, no vndbinder dep)
+cat > "${WORK}/composer_service_main.cpp" <<'EOF'
+#include <android/hardware/graphics/composer/2.1/IComposer.h>
+#include <composer-passthrough/2.1/HwcLoader.h>
+#include <hidl/HidlTransportSupport.h>
+#include <log/log.h>
+
+using android::sp;
+using android::hardware::configureRpcThreadpool;
+using android::hardware::joinRpcThreadpool;
+using android::hardware::graphics::composer::V2_1::IComposer;
+using android::hardware::graphics::composer::V2_1::passthrough::HwcLoader;
+
+int main() {
+    configureRpcThreadpool(4, true /* callerWillJoin */);
+    sp<IComposer> composer(HwcLoader::load());
+    if (!composer) {
+        ALOGE("VGuest composer@2.1: HwcLoader::load() failed");
+        return 1;
+    }
+    if (composer->registerAsService() != android::OK) {
+        ALOGE("VGuest composer@2.1: registerAsService() failed");
+        return 1;
+    }
+    ALOGI("VGuest composer@2.1: registered IComposer/default");
+    joinRpcThreadpool();
+    return 0;
+}
+EOF
+
 COMP_SRCS=$(find \
-  "${WORK}/hw-if/graphics/composer/2.1/default" \
   "${WORK}/hw-if/graphics/composer/2.1/utils/passthrough" \
   "${WORK}/hw-if/graphics/composer/2.1/utils/hal" \
   "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2on1adapter" \
   "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2onfbadapter" \
-  -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' ! -name 'passthrough.cpp' 2>/dev/null || true)
+  -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' 2>/dev/null || true)
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -fPIE -pie \
-  ${COMP_SRCS} \
+  "${WORK}/composer_service_main.cpp" ${COMP_SRCS} \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lfmq -lhardware -lutils -lcutils -llog -lbase -lsync -lc++ \
   "${STUBS}/android.hardware.graphics.composer@2.1.so" \
