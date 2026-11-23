@@ -334,7 +334,7 @@ class MainActivity : AppCompatActivity() {
     private fun stopActiveGuest() {
         activeProcess?.destroyForcibly()
         activeProcess = null
-        runOnUiThread { displayContainer.visibility = if (stage == "full") View.VISIBLE else View.GONE }
+        runOnUiThread { displayContainer.visibility = View.GONE }
     }
 
     private fun importFromUri(uri: Uri) {
@@ -440,7 +440,7 @@ class MainActivity : AppCompatActivity() {
             DisplayBridge.nativeInitDisplay(rootfsDir.absolutePath, FB_WIDTH, FB_HEIGHT)
         }
         setBusy(true)
-        runOnUiThread { displayContainer.visibility = View.GONE }
+        runOnUiThread { displayContainer.visibility = if (stage == "full") View.VISIBLE else View.GONE }
         appendLog("\n=== Launching Phase 6 Boot Stage: $stage ===")
         executor.execute {
             try {
