@@ -46,8 +46,8 @@ clone_sparse() {
 [ -d libhidl ]    || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libhidl libhidl
 [ -d libhwbinder ]|| git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libhwbinder libhwbinder
 clone_sparse https://android.googlesource.com/platform/system/core core libcutils libutils libsystem libsync include
-clone_sparse https://android.googlesource.com/platform/frameworks/native native libs/nativewindow libs/nativebase libs/arect libs/ui include
-clone_sparse https://android.googlesource.com/platform/hardware/interfaces hw-if graphics/common graphics/allocator/2.0 graphics/mapper/2.0 graphics/composer/2.1
+clone_sparse https://android.googlesource.com/platform/frameworks/native native libs/nativewindow libs/nativebase libs/arect libs/ui libs/gralloc include
+clone_sparse https://android.googlesource.com/platform/hardware/interfaces hw-if graphics/common graphics/allocator/2.0 graphics/mapper graphics/composer/2.1
 
 echo "=== [3/5] Building host hidl-gen ==="
 mkdir -p "${WORK}/hidl-gen-build"
@@ -147,6 +147,9 @@ for pkg in \
   android.hardware.graphics.common@1.2 \
   android.hardware.graphics.allocator@2.0 \
   android.hardware.graphics.mapper@2.0 \
+  android.hardware.graphics.mapper@2.1 \
+  android.hardware.graphics.mapper@3.0 \
+  android.hardware.graphics.mapper@4.0 \
   android.hardware.graphics.composer@2.1; do
   "${WORK}/hidl-gen" -o "${GEN}" -L c++-headers ${HIDL_ROOTS} "${pkg}"
 done
@@ -175,6 +178,9 @@ for lib in \
   android.hardware.graphics.common@1.2.so \
   android.hardware.graphics.allocator@2.0.so \
   android.hardware.graphics.mapper@2.0.so \
+  android.hardware.graphics.mapper@2.1.so \
+  android.hardware.graphics.mapper@3.0.so \
+  android.hardware.graphics.mapper@4.0.so \
   android.hardware.graphics.composer@2.1.so; do
   "${CC_ARM64}" -shared -fPIC "${STUBS}/stub.c" -Wl,-soname,"${lib}" -o "${STUBS}/${lib}"
 done
@@ -201,6 +207,7 @@ AOSP_INCS=(
   -I"${WORK}/native/libs/nativebase/include"
   -I"${WORK}/native/libs/arect/include"
   -I"${WORK}/native/libs/ui/include"
+  -I"${WORK}/native/libs/gralloc/types/include"
   -I"${WORK}/hw-if/graphics/mapper/2.0/utils/passthrough/include"
   -I"${WORK}/hw-if/graphics/mapper/2.0/utils/hal/include"
   -I"${WORK}/hw-if/graphics/allocator/2.0/utils/passthrough/include"
@@ -315,14 +322,18 @@ COMP_INCS=""
 for d in $(find "${WORK}/hw-if/graphics/composer/2.1/utils" -maxdepth 3 -type d -name 'include*'); do
   COMP_INCS="${COMP_INCS} -I${d}"
 done
-COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' ! -name '*Fuzz*')
+COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -path '*/vts/*' ! -path '*/test/*' ! -path '*/tests/*' ! -path '*/fuzzer/*' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' ! -name '*Fuzz*')
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" ${COMP_INCS} -DLOG_TAG='"VGuestComposer"' -DPAGE_SIZE=4096 -fPIE -pie \
   "${WORK}/composer_service_main.cpp" ${COMP_SRCS} \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lfmq -lhardware -lutils -lcutils -llog -lbase -lsync -lc++ \
   "${STUBS}/android.hardware.graphics.composer@2.1.so" \
   "${STUBS}/android.hardware.graphics.mapper@2.0.so" \
+  "${STUBS}/android.hardware.graphics.mapper@3.0.so" \
+  "${STUBS}/android.hardware.graphics.mapper@4.0.so" \
   "${STUBS}/android.hardware.graphics.common@1.0.so" \
+  "${STUBS}/android.hardware.graphics.common@1.1.so" \
+  "${STUBS}/android.hardware.graphics.common@1.2.so" \
   -o "${OUT}/libvguest_composer21_svc.so"
 
 "${STRIP}" --strip-unneeded "${OUT}"/*.so
