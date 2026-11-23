@@ -410,6 +410,18 @@ class MainActivity : AppCompatActivity() {
                 runCatching { Os.chmod(dst.absolutePath, 0x1ED) }
             }
         }
+        val hwDir = File(rootfsDir, "vendor/lib64/hw")
+        hwDir.mkdirs()
+        val grallocSrc = File(applicationInfo.nativeLibraryDir, "libvguest_gralloc.so")
+        if (grallocSrc.exists()) {
+            for (dstName in listOf("gralloc.virt.so", "gralloc.default.so")) {
+                val dst = File(hwDir, dstName)
+                if (!dst.exists() || dst.length() != grallocSrc.length()) {
+                    grallocSrc.copyTo(dst, overwrite = true)
+                    runCatching { Os.chmod(dst.absolutePath, 0x1ED) }
+                }
+            }
+        }
     }
 
     private fun runBootStage(stage: String) {
@@ -418,6 +430,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
         syncVendorEglLibs()
+        if (stage == "full") {
+            DisplayBridge.nativeInitDisplay(rootfsDir.absolutePath, FB_WIDTH, FB_HEIGHT)
+        }
         setBusy(true)
         runOnUiThread { displayContainer.visibility = View.GONE }
         appendLog("\n=== Launching Phase 6 Boot Stage: $stage ===")

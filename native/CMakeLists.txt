@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(guest_runner LANGUAGES CXX)
+project(guest_runner LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,6 +37,13 @@ target_link_libraries(guest_runner PRIVATE vguest_core)
 add_executable(vguest_fb_demo src/vguest_fb_demo.cpp)
 target_include_directories(vguest_fb_demo PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_compile_options(vguest_fb_demo PRIVATE -Wall -Wextra -O2)
+
+# Virtual gralloc0 HAL (copied into <rootfs>/vendor/lib64/hw/gralloc.{virt,default}.so)
+add_library(vguest_gralloc SHARED src/vguest_gralloc.c)
+target_compile_options(vguest_gralloc PRIVATE -Wall -Wextra -O2)
+if(NOT ANDROID)
+    target_link_libraries(vguest_gralloc PRIVATE Threads::Threads)
+endif()
 
 if(ANDROID)
     target_compile_options(guest_runner PRIVATE -fPIE)
