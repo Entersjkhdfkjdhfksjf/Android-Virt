@@ -233,7 +233,16 @@ LINK_FLAGS=(
 
 echo "=== [5/5] Cross-compiling arm64-v8a Graphics HALs ==="
 
-# 1. VGuest Virtual HWC2 HAL (hwcomposer.virt.so)
+# Force NDK libc++ headers to emit AOSP's std::__1:: ABI namespace (not std::__ndk1::)
+cat > "${WORK}/aosp_libcpp_abi.h" <<'EOF'
+#pragma once
+#include <__config_site>
+#undef _LIBCPP_ABI_NAMESPACE
+#define _LIBCPP_ABI_NAMESPACE __1
+EOF
+AOSP_STL_FLAGS=(-include "${WORK}/aosp_libcpp_abi.h" -fno-exceptions)
+
+# 1. VGuest Virtual HWC2 HAL (hwcomposer.virt.so — pure C HMI export, static STL)
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -shared \
   "${REPO_ROOT}/native/src/vguest_hwcomposer.cpp" \
   -static-libstdc++ -llog \
@@ -241,7 +250,7 @@ echo "=== [5/5] Cross-compiling arm64-v8a Graphics HALs ==="
 
 # 2. AOSP 12 IMapper@2.0 passthrough SP-HAL (wraps gralloc.virt.so)
 MAPPER_SRCS=$(find "${WORK}/hw-if/graphics/mapper/2.0/default" -name '*.cpp')
-"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -shared \
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" "${AOSP_STL_FLAGS[@]}" -shared \
   ${MAPPER_SRCS} \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lhardware -lutils -lcutils -llog -lsync -lc++ \
@@ -279,7 +288,7 @@ int main() {
 }
 EOF
 
-"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -fPIE -pie \
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" "${AOSP_STL_FLAGS[@]}" -fPIE -pie \
   "${WORK}/allocator_service_main.cpp" \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lhardware -lutils -lcutils -llog -lbase -lc++ \
@@ -323,7 +332,7 @@ for d in $(find "${WORK}/hw-if/graphics/composer/2.1/utils" -maxdepth 3 -type d 
   COMP_INCS="${COMP_INCS} -I${d}"
 done
 COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -path '*/vts/*' ! -path '*/test/*' ! -path '*/tests/*' ! -path '*/fuzzer/*' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' ! -name '*Fuzz*')
-"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" ${COMP_INCS} -DLOG_TAG='"VGuestComposer"' -DPAGE_SIZE=4096 -fPIE -pie \
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" "${AOSP_STL_FLAGS[@]}" ${COMP_INCS} -DLOG_TAG='"VGuestComposer"' -DPAGE_SIZE=4096 -fPIE -pie \
   "${WORK}/composer_service_main.cpp" ${COMP_SRCS} \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lfmq -lhardware -lutils -lcutils -llog -lbase -lsync -lc++ \
@@ -337,6 +346,14 @@ COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -
   -o "${OUT}/libvguest_composer21_svc.so"
 
 "${STRIP}" --strip-unneeded "${OUT}"/*.so
+for f in libvguest_mapper20_impl.so libvguest_allocator20_svc.so libvguest_composer21_svc.so; do
+  if "${READELF}" -s "${OUT}/${f}" | grep -q "__ndk1"; then
+    echo "ERROR: ${f} still references NDK std::__ndk1 symbols!"
+    "${READELF}" -s "${OUT}/${f}" | grep "__ndk1" | head -n 10
+    exit 1
+  fi
+done
+echo "Verified: ZERO __ndk1 symbols in AOSP-linked graphics HALs."
 ls -lh "${OUT}"/
 for f in "${OUT}"/*.so; do
   echo "--- DT_NEEDED for $(basename "$f") ---"
