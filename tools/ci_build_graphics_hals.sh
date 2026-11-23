@@ -56,17 +56,38 @@ bison -d -o hidl-gen_y.cpp --defines=hidl-gen_y.h "${WORK}/hidl-tools/hidl-gen_y
 cp hidl-gen_y.h hidl-gen_y.hh
 flex -o hidl-gen_l.cpp --header-file=hidl-gen_l.h "${WORK}/hidl-tools/hidl-gen_l.ll"
 
-LIBBASE_SRCS=$(find "${WORK}/libbase" -maxdepth 1 -name '*.cpp' \
-  ! -name '*_test.cpp' ! -name 'test_*' ! -name 'properties.cpp' ! -name 'process.cpp' ! -name 'liblog_symbols.cpp' ! -name 'logging_splitters.cpp')
-HIDL_SRCS=$(find "${WORK}/hidl-tools" -maxdepth 2 -name '*.cpp' \
-  ! -name '*_test.cpp' ! -name 'test*' ! -path '*/test/*' ! -path '*/lint/*' ! -path '*/c2hal/*' ! -path '*/build/*' ! -name '*fuzz*' ! -name '*Fuzz*')
+# Collect only POSIX libbase sources needed on Ubuntu host
+LIBBASE_SRCS=""
+for f in file.cpp logging.cpp mapped_file.cpp parsebool.cpp parsenetaddress.cpp \
+         posix_strerror_r.cpp stringprintf.cpp strings.cpp threads.cpp \
+         errors_unix.cpp chrono_utils.cpp hex.cpp; do
+  if [ -f "${WORK}/libbase/${f}" ]; then
+    LIBBASE_SRCS="${LIBBASE_SRCS} ${WORK}/libbase/${f}"
+  fi
+done
+
+# Collect only hidl-gen core + utils + host_utils + hashing (exclude hidl2aidl, metadata, c2hal, lint, tests)
+HIDL_SRCS=$(find \
+  "${WORK}/hidl-tools" \
+  -maxdepth 1 -name '*.cpp' ! -name '*_test.cpp' ! -name '*fuzz*' ! -name '*Fuzz*')
+for sub in utils host_utils hashing; do
+  if [ -d "${WORK}/hidl-tools/${sub}" ]; then
+    HIDL_SRCS="${HIDL_SRCS} $(find "${WORK}/hidl-tools/${sub}" -maxdepth 1 -name '*.cpp' ! -name '*_test.cpp' ! -name '*fuzz*')"
+  fi
+done
+
+# Discover all include dirs inside hidl-tools (including hidl-util / hidl-hash subdirs)
+HIDL_INCS=""
+for d in $(find "${WORK}/hidl-tools" -maxdepth 4 -type d \( -name 'include*' -o -name 'hidl-util' -o -name 'hidl-hash' \)); do
+  HIDL_INCS="${HIDL_INCS} -I${d}"
+done
 
 g++ -std=c++17 -O2 -w \
   -D_GNU_SOURCE \
+  -D'__builtin_available(...)=0' \
   -I"${WORK}/hidl-gen-build" \
   -I"${WORK}/hidl-tools" \
-  -I"${WORK}/hidl-tools/utils/include" \
-  -I"${WORK}/hidl-tools/include_hash" \
+  ${HIDL_INCS} \
   -I"${WORK}/libbase/include" \
   -I"${WORK}/logging/liblog/include" \
   -I"${WORK}/core/include" \
