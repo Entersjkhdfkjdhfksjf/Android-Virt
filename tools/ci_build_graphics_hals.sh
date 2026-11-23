@@ -46,19 +46,20 @@ clone_sparse() {
 [ -d libhidl ]    || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libhidl libhidl
 clone_sparse https://android.googlesource.com/platform/system/core core libcutils libutils libsystem libsync include
 clone_sparse https://android.googlesource.com/platform/frameworks/native native libs/nativewindow libs/nativebase libs/arect libs/ui include
-clone_sparse https://android.googlesource.com/platform/hardware/interfaces hw-if graphics/common graphics/allocator/2.0 graphics/mapper/2.0 graphics/composer/2.1 current.txt
+clone_sparse https://android.googlesource.com/platform/hardware/interfaces hw-if graphics/common graphics/allocator/2.0 graphics/mapper/2.0 graphics/composer/2.1
 
 echo "=== [3/5] Building host hidl-gen ==="
 mkdir -p "${WORK}/hidl-gen-build"
 cd "${WORK}/hidl-gen-build"
 
 bison -d -o hidl-gen_y.cpp --defines=hidl-gen_y.h "${WORK}/hidl-tools/hidl-gen_y.yy"
+cp hidl-gen_y.h hidl-gen_y.hh
 flex -o hidl-gen_l.cpp --header-file=hidl-gen_l.h "${WORK}/hidl-tools/hidl-gen_l.ll"
 
 LIBBASE_SRCS=$(find "${WORK}/libbase" -maxdepth 1 -name '*.cpp' \
   ! -name '*_test.cpp' ! -name 'test_*' ! -name 'properties.cpp' ! -name 'process.cpp' ! -name 'liblog_symbols.cpp' ! -name 'logging_splitters.cpp')
 HIDL_SRCS=$(find "${WORK}/hidl-tools" -maxdepth 2 -name '*.cpp' \
-  ! -name '*_test.cpp' ! -name 'test*' ! -path '*/test/*' ! -path '*/lint/*' ! -path '*/c2hal/*' ! -path '*/build/*')
+  ! -name '*_test.cpp' ! -name 'test*' ! -path '*/test/*' ! -path '*/lint/*' ! -path '*/c2hal/*' ! -path '*/build/*' ! -name '*fuzz*' ! -name '*Fuzz*')
 
 g++ -std=c++17 -O2 -w \
   -D_GNU_SOURCE \
