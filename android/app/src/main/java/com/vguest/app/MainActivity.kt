@@ -334,7 +334,7 @@ class MainActivity : AppCompatActivity() {
     private fun stopActiveGuest() {
         activeProcess?.destroyForcibly()
         activeProcess = null
-        runOnUiThread { displayContainer.visibility = View.GONE }
+        runOnUiThread { displayContainer.visibility = if (stage == "full") View.VISIBLE else View.GONE }
     }
 
     private fun importFromUri(uri: Uri) {
@@ -412,16 +412,22 @@ class MainActivity : AppCompatActivity() {
         }
         val hwDir = File(rootfsDir, "vendor/lib64/hw")
         hwDir.mkdirs()
-        val grallocSrc = File(applicationInfo.nativeLibraryDir, "libvguest_gralloc.so")
-        if (grallocSrc.exists()) {
-            for (dstName in listOf("gralloc.virt.so", "gralloc.default.so")) {
-                val dst = File(hwDir, dstName)
-                if (!dst.exists() || dst.length() != grallocSrc.length()) {
-                    grallocSrc.copyTo(dst, overwrite = true)
-                    runCatching { Os.chmod(dst.absolutePath, 0x1ED) }
-                }
+        fun copyIfChanged(srcName: String, dstFile: File) {
+            val src = File(applicationInfo.nativeLibraryDir, srcName)
+            if (src.exists() && (!dstFile.exists() || dstFile.length() != src.length())) {
+                dstFile.parentFile?.mkdirs()
+                src.copyTo(dstFile, overwrite = true)
+                runCatching { Os.chmod(dstFile.absolutePath, 0x1ED) }
             }
         }
+        copyIfChanged("libvguest_gralloc.so", File(hwDir, "gralloc.virt.so"))
+        copyIfChanged("libvguest_gralloc.so", File(hwDir, "gralloc.default.so"))
+        copyIfChanged("libvguest_hwcomposer.so", File(hwDir, "hwcomposer.virt.so"))
+        copyIfChanged("libvguest_hwcomposer.so", File(hwDir, "hwcomposer.default.so"))
+        copyIfChanged("libvguest_mapper20_impl.so", File(hwDir, "android.hardware.graphics.mapper@2.0-impl.so"))
+        val vendorHwBin = File(rootfsDir, "vendor/bin/hw")
+        copyIfChanged("libvguest_allocator20_svc.so", File(vendorHwBin, "android.hardware.graphics.allocator@2.0-service"))
+        copyIfChanged("libvguest_composer21_svc.so", File(vendorHwBin, "android.hardware.graphics.composer@2.1-service"))
     }
 
     private fun runBootStage(stage: String) {

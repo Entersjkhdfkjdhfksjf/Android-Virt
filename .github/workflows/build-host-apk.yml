@@ -6,12 +6,14 @@ on:
       - "android/**"
       - "native/**"
       - "include/**"
+      - "tools/ci_build_graphics_hals.sh"
       - ".github/workflows/build-host-apk.yml"
   pull_request:
     paths:
       - "android/**"
       - "native/**"
       - "include/**"
+      - "tools/ci_build_graphics_hals.sh"
       - ".github/workflows/build-host-apk.yml"
   workflow_dispatch:
 
@@ -104,7 +106,6 @@ jobs:
             -DCMAKE_CXX_FLAGS="-Wno-error -Wno-unused-but-set-variable -Wno-deprecated-declarations" \
             -DCMAKE_C_FLAGS="-Wno-error" \
             -DCMAKE_SHARED_LINKER_FLAGS="-landroid -llog -Wl,--allow-shlib-undefined -Wl,--unresolved-symbols=ignore-all"
-          # Compile gl_main first (~5s) to verify Android headers before the 12-min LLVM build
           cmake --build swiftshader-build --target gl_main -j$(nproc)
           cmake --build swiftshader-build --target libEGL libGLESv2 libGLES_CM -j$(nproc)
           mkdir -p swiftshader-out
@@ -114,12 +115,27 @@ jobs:
           cp $(find swiftshader-build -maxdepth 3 -name "libGLESv2*.so" | head -n 1) swiftshader-out/libGLESv2_swiftshader.so
           "$STRIP" --strip-unneeded swiftshader-out/*.so
 
-      - name: Bundle SwiftShader EGL/GLES into jniLibs
+      - name: Cache AOSP 12 Graphics HALs (arm64-v8a)
+        id: cache-graphics-hals
+        uses: actions/cache@v4
+        with:
+          path: graphics-hals-out
+          key: aosp12-graphics-hals-arm64-v8a-r1-${{ hashFiles('native/src/vguest_hwcomposer.cpp', 'tools/ci_build_graphics_hals.sh') }}
+
+      - name: Build AOSP 12 Graphics HALs (HWC2, Composer@2.1, Allocator@2.0, Mapper@2.0)
+        if: steps.cache-graphics-hals.outputs.cache-hit != 'true'
+        run: bash tools/ci_build_graphics_hals.sh
+
+      - name: Bundle SwiftShader & Graphics HALs into jniLibs
         run: |
           mkdir -p android/app/src/main/jniLibs/arm64-v8a
           cp swiftshader-out/libEGL_swiftshader.so android/app/src/main/jniLibs/arm64-v8a/
           cp swiftshader-out/libGLESv1_CM_swiftshader.so android/app/src/main/jniLibs/arm64-v8a/
           cp swiftshader-out/libGLESv2_swiftshader.so android/app/src/main/jniLibs/arm64-v8a/
+          cp graphics-hals-out/libvguest_hwcomposer.so android/app/src/main/jniLibs/arm64-v8a/
+          cp graphics-hals-out/libvguest_mapper20_impl.so android/app/src/main/jniLibs/arm64-v8a/
+          cp graphics-hals-out/libvguest_allocator20_svc.so android/app/src/main/jniLibs/arm64-v8a/
+          cp graphics-hals-out/libvguest_composer21_svc.so android/app/src/main/jniLibs/arm64-v8a/
           ls -lh android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Build Debug APK

@@ -271,7 +271,7 @@ bool BootSequencer::provision_vintf_manifest() const {
     <hal format="hidl">
         <name>android.hardware.graphics.allocator</name>
         <transport>hwbinder</transport>
-        <version>4.0</version>
+        <version>2.0</version>
         <interface>
             <name>IAllocator</name>
             <instance>default</instance>
@@ -280,7 +280,7 @@ bool BootSequencer::provision_vintf_manifest() const {
     <hal format="hidl">
         <name>android.hardware.graphics.mapper</name>
         <transport arch="64">passthrough</transport>
-        <version>4.0</version>
+        <version>2.0</version>
         <interface>
             <name>IMapper</name>
             <instance>default</instance>
@@ -289,7 +289,7 @@ bool BootSequencer::provision_vintf_manifest() const {
     <hal format="hidl">
         <name>android.hardware.graphics.composer</name>
         <transport>hwbinder</transport>
-        <version>2.4</version>
+        <version>2.1</version>
         <interface>
             <name>IComposer</name>
             <instance>default</instance>
@@ -431,9 +431,12 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "P_HW=$!\n"
         "if [ -x /system/bin/vndservicemanager ]; then /system/bin/vndservicemanager & P_VND=$!; fi\n"
         "sleep 1\n"
-        "echo '[2/4] Starting installd, system_suspend & surfaceflinger...'\n"
+        "echo '[2/4] Starting graphics HALs (allocator@2.0, composer@2.1), installd, system_suspend & surfaceflinger...'\n"
         "if [ -x /system/bin/hw/android.system.suspend@1.0-service ]; then /system/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; fi\n"
+        "if [ -x /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service ]; then /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service & P_ALLOC=$!; fi\n"
+        "if [ -x /vendor/bin/hw/android.hardware.graphics.composer@2.1-service ]; then /vendor/bin/hw/android.hardware.graphics.composer@2.1-service & P_COMP=$!; fi\n"
         "if [ -x /system/bin/installd ]; then /system/bin/installd & P_INST=$!; fi\n"
+        "sleep 1\n"
         "if [ -x /system/bin/surfaceflinger ]; then /system/bin/surfaceflinger & P_SF=$!; fi\n"
         "sleep 1\n"
         "echo '[3/4] Launching app_process64 (--zygote --start-system-server)...'\n"
@@ -453,7 +456,7 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "    /system/bin/service list | head -n 20\n"
         "  fi\n"
         "done\n"
-        "kill $P_ZYG $P_SF $P_INST $P_SUSP $P_SM $P_HW $P_VND 2>/dev/null || true\n";
+        "kill $P_ZYG $P_SF $P_COMP $P_ALLOC $P_INST $P_SUSP $P_SM $P_HW $P_VND 2>/dev/null || true\n";
 }
 
 }  // namespace vguest

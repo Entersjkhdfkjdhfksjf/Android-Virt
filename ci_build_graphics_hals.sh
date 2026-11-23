@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Cross-compiles AOSP 12 Graphics HALs (arm64-v8a) on GitHub Actions (ubuntu-latest):
+#   1. libvguest_hwcomposer.so     -> /vendor/lib64/hw/hwcomposer.{virt,default}.so
+#   2. libvguest_mapper20_impl.so  -> /vendor/lib64/hw/android.hardware.graphics.mapper@2.0-impl.so
+#   3. libvguest_allocator20_svc.so -> /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service
+#   4. libvguest_composer21_svc.so  -> /vendor/bin/hw/android.hardware.graphics.composer@2.1-service
+
+REPO_ROOT="$(pwd)"
+WORK="${REPO_ROOT}/hal-build"
+OUT="${REPO_ROOT}/graphics-hals-out"
+mkdir -p "${WORK}" "${OUT}"
+
+NDK_PATH="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+if [ -z "${NDK_PATH}" ] || [ ! -d "${NDK_PATH}" ]; then
+  NDK_PATH="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+fi
+TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+CXX_ARM64="${TOOLCHAIN}/aarch64-linux-android31-clang++"
+CC_ARM64="${TOOLCHAIN}/aarch64-linux-android31-clang"
+STRIP="${TOOLCHAIN}/llvm-strip"
+READELF="${TOOLCHAIN}/llvm-readelf"
+
+echo "=== [1/5] Installing host build deps (bison, flex, libssl-dev) ==="
+sudo apt-get update -qq
+sudo apt-get install -y -qq bison flex libssl-dev
+
+echo "=== [2/5] Cloning AOSP android-12.1.0_r27 HIDL & Graphics HAL repos ==="
+cd "${WORK}"
+TAG="android-12.1.0_r27"
+
+clone_sparse() {
+  local url="$1" dir="$2"; shift 2
+  if [ ! -d "${dir}" ]; then
+    git clone --branch "${TAG}" --depth 1 --filter=blob:none --sparse "${url}" "${dir}"
+    git -C "${dir}" sparse-checkout set "$@"
+  fi
+}
+
+[ -d hidl-tools ] || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/tools/hidl hidl-tools
+[ -d libbase ]    || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libbase libbase
+[ -d logging ]    || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/logging logging
+[ -d libhardware ]|| git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/hardware/libhardware libhardware
+[ -d libfmq ]     || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libfmq libfmq
+[ -d libhidl ]    || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libhidl libhidl
+clone_sparse https://android.googlesource.com/platform/system/core core libcutils libutils libsystem libsync include
+clone_sparse https://android.googlesource.com/platform/frameworks/native native libs/nativewindow libs/nativebase libs/arect libs/ui include
+clone_sparse https://android.googlesource.com/platform/hardware/interfaces hw-if graphics/common graphics/allocator/2.0 graphics/mapper/2.0 graphics/composer/2.1 current.txt
+
+echo "=== [3/5] Building host hidl-gen ==="
+mkdir -p "${WORK}/hidl-gen-build"
+cd "${WORK}/hidl-gen-build"
+
+bison -d -o hidl-gen_y.cpp --defines=hidl-gen_y.h "${WORK}/hidl-tools/hidl-gen_y.yy"
+flex -o hidl-gen_l.cpp --header-file=hidl-gen_l.h "${WORK}/hidl-tools/hidl-gen_l.ll"
+
+LIBBASE_SRCS=$(find "${WORK}/libbase" -maxdepth 1 -name '*.cpp' \
+  ! -name '*_test.cpp' ! -name 'test_*' ! -name 'properties.cpp' ! -name 'process.cpp' ! -name 'liblog_symbols.cpp' ! -name 'logging_splitters.cpp')
+HIDL_SRCS=$(find "${WORK}/hidl-tools" -maxdepth 2 -name '*.cpp' \
+  ! -name '*_test.cpp' ! -name 'test*' ! -path '*/test/*' ! -path '*/lint/*' ! -path '*/c2hal/*' ! -path '*/build/*')
+
+g++ -std=c++17 -O2 -w \
+  -D_GNU_SOURCE \
+  -I"${WORK}/hidl-gen-build" \
+  -I"${WORK}/hidl-tools" \
+  -I"${WORK}/hidl-tools/utils/include" \
+  -I"${WORK}/hidl-tools/include_hash" \
+  -I"${WORK}/libbase/include" \
+  -I"${WORK}/logging/liblog/include" \
+  -I"${WORK}/core/include" \
+  hidl-gen_y.cpp hidl-gen_l.cpp ${HIDL_SRCS} ${LIBBASE_SRCS} \
+  -lcrypto -lpthread \
+  -o "${WORK}/hidl-gen"
+
+"${WORK}/hidl-gen" --version || true
+
+echo "=== [4/5] Generating AOSP 12 HIDL C++ headers ==="
+GEN="${WORK}/hidl-gen-out"
+mkdir -p "${GEN}"
+HIDL_ROOTS="-r android.hardware:${WORK}/hw-if -r android.hidl:${WORK}/libhidl/transport"
+
+for pkg in \
+  android.hidl.base@1.0 \
+  android.hidl.manager@1.0 \
+  android.hardware.graphics.common@1.0 \
+  android.hardware.graphics.allocator@2.0 \
+  android.hardware.graphics.mapper@2.0 \
+  android.hardware.graphics.composer@2.1; do
+  "${WORK}/hidl-gen" -o "${GEN}" -L c++-headers ${HIDL_ROOTS} "${pkg}"
+done
+
+# Create tiny empty stub .so libraries matching GSI /system/lib64/ DT_NEEDED names
+STUBS="${WORK}/stubs"
+mkdir -p "${STUBS}"
+cat > "${STUBS}/stub.c" <<'EOF'
+void __vguest_stub(void) {}
+EOF
+
+for lib in \
+  libhidlbase.so \
+  libfmq.so \
+  libhardware.so \
+  libutils.so \
+  libcutils.so \
+  liblog.so \
+  libbase.so \
+  libsync.so \
+  libc++.so \
+  android.hidl.base@1.0.so \
+  android.hidl.manager@1.0.so \
+  android.hardware.graphics.common@1.0.so \
+  android.hardware.graphics.allocator@2.0.so \
+  android.hardware.graphics.mapper@2.0.so \
+  android.hardware.graphics.composer@2.1.so; do
+  "${CC_ARM64}" -shared -fPIC "${STUBS}/stub.c" -Wl,-soname,"${lib}" -o "${STUBS}/${lib}"
+done
+
+AOSP_INCS=(
+  -I"${GEN}"
+  -I"${REPO_ROOT}/include"
+  -I"${WORK}/libhardware/include"
+  -I"${WORK}/libhidl/base/include"
+  -I"${WORK}/libhidl/transport/include"
+  -I"${WORK}/libhidl/libhidlmemory/include"
+  -I"${WORK}/libfmq/include"
+  -I"${WORK}/libfmq/base"
+  -I"${WORK}/libbase/include"
+  -I"${WORK}/logging/liblog/include"
+  -I"${WORK}/core/include"
+  -I"${WORK}/core/libcutils/include"
+  -I"${WORK}/core/libutils/include"
+  -I"${WORK}/core/libsystem/include"
+  -I"${WORK}/core/libsync/include"
+  -I"${WORK}/native/include"
+  -I"${WORK}/native/libs/nativewindow/include"
+  -I"${WORK}/native/libs/nativebase/include"
+  -I"${WORK}/native/libs/arect/include"
+  -I"${WORK}/native/libs/ui/include"
+  -I"${WORK}/hw-if/graphics/mapper/2.0/utils/passthrough/include"
+  -I"${WORK}/hw-if/graphics/mapper/2.0/utils/hal/include"
+  -I"${WORK}/hw-if/graphics/allocator/2.0/utils/passthrough/include"
+  -I"${WORK}/hw-if/graphics/allocator/2.0/utils/hal/include"
+  -I"${WORK}/hw-if/graphics/composer/2.1/utils/passthrough/include"
+  -I"${WORK}/hw-if/graphics/composer/2.1/utils/hal/include"
+  -I"${WORK}/hw-if/graphics/composer/2.1/utils/command-buffer/include"
+  -I"${WORK}/hw-if/graphics/composer/2.1/utils/hwc2on1adapter/include"
+  -I"${WORK}/hw-if/graphics/composer/2.1/utils/hwc2onfbadapter/include"
+)
+
+COMMON_CXXFLAGS=(
+  -std=c++17 -O2 -fPIC -Wno-everything -D__ANDROID_VNDK__
+  "${AOSP_INCS[@]}"
+)
+LINK_FLAGS=(
+  -L"${STUBS}"
+  -Wl,--no-as-needed
+  -Wl,--allow-shlib-undefined
+  -Wl,--unresolved-symbols=ignore-all
+  -nostdlib++
+)
+
+echo "=== [5/5] Cross-compiling arm64-v8a Graphics HALs ==="
+
+# 1. VGuest Virtual HWC2 HAL (hwcomposer.virt.so)
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -shared \
+  "${REPO_ROOT}/native/src/vguest_hwcomposer.cpp" \
+  -static-libstdc++ -llog \
+  -o "${OUT}/libvguest_hwcomposer.so"
+
+# 2. AOSP 12 IMapper@2.0 passthrough SP-HAL (wraps gralloc.virt.so)
+MAPPER_SRCS=$(find "${WORK}/hw-if/graphics/mapper/2.0/default" -name '*.cpp')
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -shared \
+  ${MAPPER_SRCS} \
+  "${LINK_FLAGS[@]}" \
+  -lhidlbase -lhardware -lutils -lcutils -llog -lsync -lc++ \
+  -landroid.hardware.graphics.mapper@2.0 \
+  -landroid.hardware.graphics.common@1.0 \
+  -o "${OUT}/libvguest_mapper20_impl.so"
+
+# 3. AOSP 12 IAllocator@2.0 binderized service (wraps gralloc.virt.so)
+ALLOC_SRCS=$(find "${WORK}/hw-if/graphics/allocator/2.0/default" -name '*.cpp')
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -fPIE -pie \
+  ${ALLOC_SRCS} \
+  "${LINK_FLAGS[@]}" \
+  -lhidlbase -lhardware -lutils -lcutils -llog -lbase -lc++ \
+  -landroid.hardware.graphics.allocator@2.0 \
+  -landroid.hardware.graphics.common@1.0 \
+  -o "${OUT}/libvguest_allocator20_svc.so"
+
+# 4. AOSP 12 IComposer@2.1 binderized service (wraps hwcomposer.virt.so)
+COMP_SRCS=$(find \
+  "${WORK}/hw-if/graphics/composer/2.1/default" \
+  "${WORK}/hw-if/graphics/composer/2.1/utils/passthrough" \
+  "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2on1adapter" \
+  "${WORK}/hw-if/graphics/composer/2.1/utils/hwc2onfbadapter" \
+  -name '*.cpp' ! -name '*Test.cpp' ! -name '*test*.cpp')
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -fPIE -pie \
+  ${COMP_SRCS} \
+  "${LINK_FLAGS[@]}" \
+  -lhidlbase -lfmq -lhardware -lutils -lcutils -llog -lbase -lsync -lc++ \
+  -landroid.hardware.graphics.composer@2.1 \
+  -landroid.hardware.graphics.common@1.0 \
+  -o "${OUT}/libvguest_composer21_svc.so"
+
+"${STRIP}" --strip-unneeded "${OUT}"/*.so
+ls -lh "${OUT}"/
+for f in "${OUT}"/*.so; do
+  echo "--- DT_NEEDED for $(basename "$f") ---"
+  "${READELF}" -d "$f" | grep NEEDED || true
+done
