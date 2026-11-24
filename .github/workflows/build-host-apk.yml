@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: swiftshader-out
-          key: swiftshader-gles-arm64-v8a-llvm-r2
+          key: swiftshader-gles-arm64-v8a-llvm-r3
 
       - name: Build SwiftShader OpenGL ES (arm64-v8a)
         if: steps.cache-swiftshader.outputs.cache-hit != 'true'
@@ -120,6 +120,11 @@ jobs:
               if txt != orig:
                   p.write_text(txt)
                   print(f"Patched {p}")
+          # Provide stub for AndroidEnterDebugger() (_Z20AndroidEnterDebuggerv) absent from AOSP 12 libutils.so
+          dbg_cpp = root / "src/OpenGL/common/debug.cpp"
+          if dbg_cpp.exists():
+              dbg_cpp.write_text(dbg_cpp.read_text() + "\nvoid AndroidEnterDebugger() {}\n")
+              print("Added AndroidEnterDebugger() stub to debug.cpp")
           PYEOF
 
           AOSP_INC_DIRS=$(find "${PWD}/aosp-core" "${PWD}/aosp-logging" "${PWD}/aosp-hw" "${PWD}/aosp-native" -maxdepth 4 -type d -name 'include*' | tr '\n' ' ')
@@ -155,6 +160,10 @@ jobs:
             echo "ERROR: libEGL_swiftshader.so still missing EGL_NATIVE_BUFFER_ANDROID path!"
             exit 1
           fi
+          if "${READELF}" -Ws swiftshader-out/*.so | grep -qE "UND.*AndroidEnterDebugger"; then
+            echo "ERROR: SwiftShader still has undefined AndroidEnterDebugger!"
+            exit 1
+          fi
 
       - name: Cache AOSP 12 Graphics HALs (arm64-v8a)
         id: cache-graphics-hals
@@ -177,6 +186,7 @@ jobs:
           cp graphics-hals-out/libvguest_mapper20_impl.so android/app/src/main/jniLibs/arm64-v8a/
           cp graphics-hals-out/libvguest_allocator20_svc.so android/app/src/main/jniLibs/arm64-v8a/
           cp graphics-hals-out/libvguest_composer21_svc.so android/app/src/main/jniLibs/arm64-v8a/
+          cp graphics-hals-out/libvguest_suspend_svc.so android/app/src/main/jniLibs/arm64-v8a/
           ls -lh android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Build Debug APK

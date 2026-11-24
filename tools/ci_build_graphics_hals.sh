@@ -48,6 +48,7 @@ clone_sparse() {
 clone_sparse https://android.googlesource.com/platform/system/core core libcutils libutils libsystem libsync include
 clone_sparse https://android.googlesource.com/platform/frameworks/native native libs/nativewindow libs/nativebase libs/arect libs/ui libs/gralloc include
 clone_sparse https://android.googlesource.com/platform/hardware/interfaces hw-if graphics/common graphics/allocator/2.0 graphics/mapper graphics/composer/2.1
+clone_sparse https://android.googlesource.com/platform/system/hardware/interfaces sys-hw-if suspend/1.0
 
 echo "=== [3/5] Building host hidl-gen ==="
 mkdir -p "${WORK}/hidl-gen-build"
@@ -136,7 +137,7 @@ g++ -std=c++17 -O2 -w \
 echo "=== [4/5] Generating AOSP 12 HIDL C++ headers ==="
 GEN="${WORK}/hidl-gen-out"
 mkdir -p "${GEN}"
-HIDL_ROOTS="-r android.hardware:${WORK}/hw-if -r android.hidl:${WORK}/libhidl/transport"
+HIDL_ROOTS="-r android.hardware:${WORK}/hw-if -r android.system:${WORK}/sys-hw-if -r android.hidl:${WORK}/libhidl/transport"
 
 for pkg in \
   android.hidl.base@1.0 \
@@ -150,7 +151,8 @@ for pkg in \
   android.hardware.graphics.mapper@2.1 \
   android.hardware.graphics.mapper@3.0 \
   android.hardware.graphics.mapper@4.0 \
-  android.hardware.graphics.composer@2.1; do
+  android.hardware.graphics.composer@2.1 \
+  android.system.suspend@1.0; do
   "${WORK}/hidl-gen" -o "${GEN}" -L c++-headers ${HIDL_ROOTS} "${pkg}"
 done
 
@@ -181,7 +183,8 @@ for lib in \
   android.hardware.graphics.mapper@2.1.so \
   android.hardware.graphics.mapper@3.0.so \
   android.hardware.graphics.mapper@4.0.so \
-  android.hardware.graphics.composer@2.1.so; do
+  android.hardware.graphics.composer@2.1.so \
+  android.system.suspend@1.0.so; do
   "${CC_ARM64}" -shared -fPIC "${STUBS}/stub.c" -Wl,-soname,"${lib}" -o "${STUBS}/${lib}"
 done
 
@@ -366,8 +369,58 @@ COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -
   "${STUBS}/android.hardware.graphics.common@1.2.so" \
   -o "${OUT}/libvguest_composer21_svc.so"
 
+# 5. Virtualized AOSP 12 ISystemSuspend@1.0 service (zero /sys/power/* or /sys/class/wakeup deps)
+cat > "${WORK}/suspend_service_main.cpp" <<'CPPEOF'
+#define LOG_TAG "VGuestSuspend"
+#include <android/system/suspend/1.0/ISystemSuspend.h>
+#include <android/system/suspend/1.0/IWakeLock.h>
+#include <hidl/HidlTransportSupport.h>
+#include <log/log.h>
+
+using android::sp;
+using android::hardware::Return;
+using android::hardware::Void;
+using android::hardware::configureRpcThreadpool;
+using android::hardware::joinRpcThreadpool;
+using android::hardware::hidl_string;
+using android::system::suspend::V1_0::ISystemSuspend;
+using android::system::suspend::V1_0::IWakeLock;
+using android::system::suspend::V1_0::WakeLockType;
+
+struct VGuestWakeLock : public IWakeLock {
+    Return<void> release() override { return Void(); }
+};
+
+struct VGuestSystemSuspend : public ISystemSuspend {
+    Return<sp<IWakeLock>> acquireWakeLock(WakeLockType, const hidl_string&) override {
+        return sp<IWakeLock>(new VGuestWakeLock());
+    }
+    Return<bool> enableAutosuspend() override { return true; }
+    Return<bool> forceSuspend() override { return false; }
+};
+
+int main() {
+    configureRpcThreadpool(2, true /* callerWillJoin */);
+    sp<ISystemSuspend> svc(new VGuestSystemSuspend());
+    if (svc->registerAsService() != android::OK) {
+        ALOGE("VGuest suspend@1.0: registerAsService() failed");
+        return 1;
+    }
+    ALOGI("VGuest suspend@1.0: registered ISystemSuspend/default");
+    joinRpcThreadpool();
+    return 0;
+}
+CPPEOF
+
+"${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" "${AOSP_STL_FLAGS[@]}" -fPIE -pie \
+  "${WORK}/suspend_service_main.cpp" "${WORK}/aosp_libcpp_compat.cpp" \
+  "${LINK_FLAGS[@]}" \
+  -lhidlbase -lutils -lcutils -llog -lbase -lc++ \
+  "${STUBS}/android.system.suspend@1.0.so" \
+  -o "${OUT}/libvguest_suspend_svc.so"
+
 "${STRIP}" --strip-unneeded "${OUT}"/*.so
-for f in libvguest_mapper20_impl.so libvguest_allocator20_svc.so libvguest_composer21_svc.so; do
+for f in libvguest_mapper20_impl.so libvguest_allocator20_svc.so libvguest_composer21_svc.so libvguest_suspend_svc.so; do
   if "${READELF}" -s "${OUT}/${f}" | grep -qE "UND.*(_ZTI|_ZTS|__ndk1|__libcpp_verbose_abort|__hash_memory)"; then
     echo "ERROR: ${f} still references NDK __ndk1 or RTTI _ZTI symbols!"
     "${READELF}" -s "${OUT}/${f}" | grep -E "UND.*(_ZTI|_ZTS|__ndk1|__libcpp_verbose_abort|__hash_memory)" | head -n 10

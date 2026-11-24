@@ -428,6 +428,7 @@ class MainActivity : AppCompatActivity() {
         val vendorHwBin = File(rootfsDir, "vendor/bin/hw")
         copyIfChanged("libvguest_allocator20_svc.so", File(vendorHwBin, "android.hardware.graphics.allocator@2.0-service"))
         copyIfChanged("libvguest_composer21_svc.so", File(vendorHwBin, "android.hardware.graphics.composer@2.1-service"))
+        copyIfChanged("libvguest_suspend_svc.so", File(vendorHwBin, "android.system.suspend@1.0-service"))
     }
 
     private fun runBootStage(stage: String) {

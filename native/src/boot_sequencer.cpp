@@ -432,7 +432,7 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "if [ -x /system/bin/vndservicemanager ]; then /system/bin/vndservicemanager & P_VND=$!; fi\n"
         "sleep 1\n"
         "echo '[2/4] Starting graphics HALs (allocator@2.0, composer@2.1), installd, system_suspend & surfaceflinger...'\n"
-        "if [ -x /system/bin/hw/android.system.suspend@1.0-service ]; then /system/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; fi\n"
+        "if [ -x /vendor/bin/hw/android.system.suspend@1.0-service ]; then /vendor/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; elif [ -x /system/bin/hw/android.system.suspend@1.0-service ]; then /system/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; fi\n"
         "if [ -x /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service ]; then /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service & P_ALLOC=$!; fi\n"
         "if [ -x /vendor/bin/hw/android.hardware.graphics.composer@2.1-service ]; then /vendor/bin/hw/android.hardware.graphics.composer@2.1-service & P_COMP=$!; fi\n"
         "if [ -x /system/bin/installd ]; then /system/bin/installd & P_INST=$!; fi\n"
