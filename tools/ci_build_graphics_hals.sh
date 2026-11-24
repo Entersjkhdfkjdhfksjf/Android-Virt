@@ -236,11 +236,11 @@ echo "=== [5/5] Cross-compiling arm64-v8a Graphics HALs ==="
 # Force NDK libc++ headers to emit AOSP's std::__1:: ABI namespace (not std::__ndk1::)
 cat > "${WORK}/aosp_libcpp_abi.h" <<'EOF'
 #pragma once
-#include <stdlib.h>
 #include <__config_site>
 #undef _LIBCPP_ABI_NAMESPACE
 #define _LIBCPP_ABI_NAMESPACE __1
-#define _LIBCPP_VERBOSE_ABORT(...) abort()
+extern "C" void abort(void) __attribute__((noreturn));
+#define _LIBCPP_VERBOSE_ABORT(...) ::abort()
 EOF
 AOSP_STL_FLAGS=(-include "${WORK}/aosp_libcpp_abi.h" -fno-exceptions -fno-rtti)
 
