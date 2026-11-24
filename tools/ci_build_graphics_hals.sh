@@ -395,8 +395,6 @@ struct VGuestSystemSuspend : public ISystemSuspend {
     Return<sp<IWakeLock>> acquireWakeLock(WakeLockType, const hidl_string&) override {
         return sp<IWakeLock>(new VGuestWakeLock());
     }
-    Return<bool> enableAutosuspend() override { return true; }
-    Return<bool> forceSuspend() override { return false; }
 };
 
 int main() {
