@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: swiftshader-out
-          key: swiftshader-gles-arm64-v8a-llvm-r1
+          key: swiftshader-gles-arm64-v8a-llvm-r2
 
       - name: Build SwiftShader OpenGL ES (arm64-v8a)
         if: steps.cache-swiftshader.outputs.cache-hit != 'true'
@@ -71,6 +71,11 @@ jobs:
           if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
             NDK_PATH=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)
           fi
+          TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC_ARM64="${TOOLCHAIN}/aarch64-linux-android31-clang"
+          STRIP="${TOOLCHAIN}/llvm-strip"
+          READELF="${TOOLCHAIN}/llvm-readelf"
+
           git clone --branch android-12.1.0_r27 --depth 1 \
             https://android.googlesource.com/platform/external/swiftshader swiftshader-src
           git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
@@ -85,8 +90,38 @@ jobs:
             https://android.googlesource.com/platform/frameworks/native aosp-native && \
             git -C aosp-native sparse-checkout set libs/nativewindow libs/nativebase libs/arect libs/ui include
 
-          echo '=== Discovered AOSP headers ==='
-          find aosp-core aosp-logging aosp-hw aosp-native -name 'native_handle.h' -o -name 'window.h' -o -name 'gralloc.h' | head -n 20
+          # Build C stub libraries for AOSP platform libs needed by SwiftShader GrallocModule/AndroidNativeImage
+          mkdir -p swiftshader-stubs
+          echo 'void __vguest_sw_stub(void) {}' > swiftshader-stubs/stub.c
+          for lib in libhardware.so libsync.so libcutils.so libutils.so; do
+            "${CC_ARM64}" -shared -fPIC swiftshader-stubs/stub.c -Wl,-soname,"${lib}" -o "swiftshader-stubs/${lib}"
+          done
+
+          # Enable Android platform EGL_ANDROID_image_native_buffer (GrallocModule + AndroidNativeImage)
+          # which SwiftShader's CMake NDK build disables via ANDROID_NDK_BUILD / !ANDROID_PLATFORM_SDK_VERSION
+          echo '=== SwiftShader Android guards before patch ==='
+          grep -rnE "ANDROID_NDK_BUILD|ANDROID_PLATFORM_SDK_VERSION|EGL_NATIVE_BUFFER_ANDROID|EGL_ANDROID_image_native_buffer|GrallocModule" \
+            swiftshader-src/CMakeLists.txt swiftshader-src/src/OpenGL/libEGL/ swiftshader-src/src/Android/ | head -n 40 || true
+          python3 - << 'PYEOF'
+          from pathlib import Path
+          import re
+          root = Path("swiftshader-src")
+          for p in list(root.glob("CMakeLists.txt")) + list(root.rglob("*.cpp")) + list(root.rglob("*.hpp")) + list(root.rglob("*.h")):
+              try:
+                  txt = p.read_text()
+              except Exception:
+                  continue
+              orig = txt
+              txt = txt.replace("&& !defined(ANDROID_NDK_BUILD)", "")
+              txt = txt.replace("!defined(ANDROID_NDK_BUILD) &&", "")
+              txt = txt.replace("defined(__ANDROID__) && !defined(__ANDROID_NDK__)", "defined(__ANDROID__)")
+              txt = txt.replace("-DANDROID_NDK_BUILD", "")
+              txt = txt.replace("ANDROID_NDK_BUILD", "VGUEST_DISABLED_NDK_BUILD")
+              if txt != orig:
+                  p.write_text(txt)
+                  print(f"Patched {p}")
+          PYEOF
+
           AOSP_INC_DIRS=$(find "${PWD}/aosp-core" "${PWD}/aosp-logging" "${PWD}/aosp-hw" "${PWD}/aosp-native" -maxdepth 4 -type d -name 'include*' | tr '\n' ' ')
           echo "include_directories(SYSTEM ${AOSP_INC_DIRS})" > "${PWD}/swiftshader-aosp-inc.cmake"
 
@@ -103,17 +138,23 @@ jobs:
             -DSWIFTSHADER_BUILD_TESTS=OFF \
             -DREACTOR_BACKEND=LLVM \
             -DSWIFTSHADER_WARNINGS_AS_ERRORS=OFF \
-            -DCMAKE_CXX_FLAGS="-Wno-error -Wno-unused-but-set-variable -Wno-deprecated-declarations" \
-            -DCMAKE_C_FLAGS="-Wno-error" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-landroid -llog -Wl,--allow-shlib-undefined -Wl,--unresolved-symbols=ignore-all"
+            -DCMAKE_CXX_FLAGS="-Wno-error -Wno-unused-but-set-variable -Wno-deprecated-declarations -DANDROID_PLATFORM_SDK_VERSION=31" \
+            -DCMAKE_C_FLAGS="-Wno-error -DANDROID_PLATFORM_SDK_VERSION=31" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L${PWD}/swiftshader-stubs -Wl,--no-as-needed -lhardware -lsync -lcutils -landroid -llog -Wl,--allow-shlib-undefined -Wl,--unresolved-symbols=ignore-all"
           cmake --build swiftshader-build --target gl_main -j$(nproc)
           cmake --build swiftshader-build --target libEGL libGLESv2 libGLES_CM -j$(nproc)
           mkdir -p swiftshader-out
-          STRIP="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           cp $(find swiftshader-build -maxdepth 3 -name "libEGL*.so" | head -n 1) swiftshader-out/libEGL_swiftshader.so
           cp $(find swiftshader-build -maxdepth 3 -name "libGLES*CM*.so" | head -n 1) swiftshader-out/libGLESv1_CM_swiftshader.so
           cp $(find swiftshader-build -maxdepth 3 -name "libGLESv2*.so" | head -n 1) swiftshader-out/libGLESv2_swiftshader.so
           "$STRIP" --strip-unneeded swiftshader-out/*.so
+          echo '=== Verifying SwiftShader EGL_ANDROID_image_native_buffer & DT_NEEDED ==='
+          "${READELF}" -d swiftshader-out/libEGL_swiftshader.so | grep NEEDED || true
+          strings swiftshader-out/libEGL_swiftshader.so | grep -E "EGL_ANDROID_image_native_buffer|hw_get_module" || true
+          if ! strings swiftshader-out/libEGL_swiftshader.so | grep -q "EGL_ANDROID_image_native_buffer"; then
+            echo "ERROR: libEGL_swiftshader.so still missing EGL_ANDROID_image_native_buffer!"
+            exit 1
+          fi
 
       - name: Cache AOSP 12 Graphics HALs (arm64-v8a)
         id: cache-graphics-hals

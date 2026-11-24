@@ -258,7 +258,23 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
         }
     };
 
+    auto wit = client.waiting_reply_depth.find(target_tid);
+    bool is_waiting_reply = (wit != client.waiting_reply_depth.end() && wit->second > 0);
+
+    // If process-wide transactions (e.g. oneway IServiceNotification::onRegistration)
+    // are queued while this thread is only waiting for a reply (or draining thread_inboxes)
+    // and no binder looper thread exists, emit BR_SPAWN_LOOPER FIRST so
+    // IPCThreadState::waitForResponse() spawns a looper before returning on BR_REPLY.
     auto& tq = client.thread_inboxes[target_tid];
+    if (!client.inbox.empty() && client.active_loopers == 0 &&
+        !client.spawn_looper_sent && client.max_threads > 0 &&
+        (is_waiting_reply || !tq.empty()) &&
+        out.size() + sizeof(uint32_t) <= bwr.read_size) {
+        uint32_t spawn_cmd = binder::kBrSpawnLooper;
+        const auto* sp_bytes = reinterpret_cast<const uint8_t*>(&spawn_cmd);
+        out.insert(out.end(), sp_bytes, sp_bytes + sizeof(spawn_cmd));
+        client.spawn_looper_sent = true;
+    }
     while (!tq.empty()) {
         const auto& ev = tq.front();
         if (out.size() + ev.bytes.size() > bwr.read_size) break;
@@ -272,8 +288,6 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
 
     // Only pull process-wide transactions/refcounts if this thread isn't actively blocked
     // waiting for a synchronous BR_REPLY.
-    auto wit = client.waiting_reply_depth.find(target_tid);
-    bool is_waiting_reply = (wit != client.waiting_reply_depth.end() && wit->second > 0);
     if (!is_waiting_reply) {
         while (!client.inbox.empty()) {
             const auto& ev = client.inbox.front();
@@ -683,7 +697,11 @@ void VBinderBroker::process_write_buffer(DomainState& dom, ClientState& sender,
             }
             case binder::kBcRegisterLooper:
             case binder::kBcEnterLooper:
+                sender.active_loopers++;
+                sender.spawn_looper_sent = false;
+                break;
             case binder::kBcExitLooper:
+                if (sender.active_loopers > 0) sender.active_loopers--;
                 break;
             case binder::kBcRequestDeathNotif: {
                 if (pos + sizeof(binder::binder_handle_cookie) > wbuf.size()) return;
