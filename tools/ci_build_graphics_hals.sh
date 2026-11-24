@@ -242,6 +242,25 @@ cat > "${WORK}/aosp_libcpp_abi.h" <<'EOF'
 extern "C" void abort(void) __attribute__((noreturn));
 #define _LIBCPP_VERBOSE_ABORT(...) ::abort()
 EOF
+cat > "${WORK}/aosp_libcpp_compat.cpp" <<'EOF'
+#include <stddef.h>
+#include <stdint.h>
+namespace std {
+inline namespace __1 {
+// Polyfill for LLVM 19+ libc++ __hash_memory (absent in AOSP 12's LLVM 12 libc++.so)
+__attribute__((visibility("hidden")))
+size_t __hash_memory(const void* ptr, size_t len) noexcept {
+    const auto* p = static_cast<const uint8_t*>(ptr);
+    size_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; ++i) {
+        h ^= static_cast<size_t>(p[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+}  // namespace __1
+}  // namespace std
+EOF
 AOSP_STL_FLAGS=(-include "${WORK}/aosp_libcpp_abi.h" -fno-exceptions -fno-rtti)
 
 # 1. VGuest Virtual HWC2 HAL (hwcomposer.virt.so — pure C HMI export, static STL)
@@ -253,7 +272,7 @@ AOSP_STL_FLAGS=(-include "${WORK}/aosp_libcpp_abi.h" -fno-exceptions -fno-rtti)
 # 2. AOSP 12 IMapper@2.0 passthrough SP-HAL (wraps gralloc.virt.so)
 MAPPER_SRCS=$(find "${WORK}/hw-if/graphics/mapper/2.0/default" -name '*.cpp')
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" "${AOSP_STL_FLAGS[@]}" -shared \
-  ${MAPPER_SRCS} \
+  ${MAPPER_SRCS} "${WORK}/aosp_libcpp_compat.cpp" \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lhardware -lutils -lcutils -llog -lsync -lc++ \
   "${STUBS}/android.hardware.graphics.mapper@2.0.so" \
@@ -291,7 +310,7 @@ int main() {
 EOF
 
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" "${AOSP_STL_FLAGS[@]}" -fPIE -pie \
-  "${WORK}/allocator_service_main.cpp" \
+  "${WORK}/allocator_service_main.cpp" "${WORK}/aosp_libcpp_compat.cpp" \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lhardware -lutils -lcutils -llog -lbase -lc++ \
   "${STUBS}/android.hardware.graphics.allocator@2.0.so" \
@@ -335,7 +354,7 @@ for d in $(find "${WORK}/hw-if/graphics/composer/2.1/utils" -maxdepth 3 -type d 
 done
 COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -path '*/vts/*' ! -path '*/test/*' ! -path '*/tests/*' ! -path '*/fuzzer/*' ! -name '*Test.cpp' ! -name '*test*.cpp' ! -name '*fuzz*' ! -name '*Fuzz*')
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" "${AOSP_STL_FLAGS[@]}" ${COMP_INCS} -DLOG_TAG='"VGuestComposer"' -DPAGE_SIZE=4096 -fPIE -pie \
-  "${WORK}/composer_service_main.cpp" ${COMP_SRCS} \
+  "${WORK}/composer_service_main.cpp" "${WORK}/aosp_libcpp_compat.cpp" ${COMP_SRCS} \
   "${LINK_FLAGS[@]}" \
   -lhidlbase -lfmq -lhardware -lutils -lcutils -llog -lbase -lsync -lc++ \
   "${STUBS}/android.hardware.graphics.composer@2.1.so" \
@@ -349,9 +368,9 @@ COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -
 
 "${STRIP}" --strip-unneeded "${OUT}"/*.so
 for f in libvguest_mapper20_impl.so libvguest_allocator20_svc.so libvguest_composer21_svc.so; do
-  if "${READELF}" -s "${OUT}/${f}" | grep -qE "UND.*(_ZTI|_ZTS|__ndk1|__libcpp_verbose_abort)"; then
+  if "${READELF}" -s "${OUT}/${f}" | grep -qE "UND.*(_ZTI|_ZTS|__ndk1|__libcpp_verbose_abort|__hash_memory)"; then
     echo "ERROR: ${f} still references NDK __ndk1 or RTTI _ZTI symbols!"
-    "${READELF}" -s "${OUT}/${f}" | grep -E "UND.*(_ZTI|_ZTS|__ndk1|__libcpp_verbose_abort)" | head -n 10
+    "${READELF}" -s "${OUT}/${f}" | grep -E "UND.*(_ZTI|_ZTS|__ndk1|__libcpp_verbose_abort|__hash_memory)" | head -n 10
     exit 1
   fi
 done

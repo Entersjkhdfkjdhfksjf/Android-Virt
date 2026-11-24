@@ -68,6 +68,14 @@ struct binder_buffer_object {
     binder_size_t parent_offset;
 };
 
+struct binder_fd_array_object {
+    struct binder_object_header hdr;
+    uint32_t pad;
+    binder_size_t num_fds;
+    binder_size_t parent;
+    binder_size_t parent_offset;
+};
+
 struct binder_write_read {
     binder_size_t write_size;
     binder_size_t write_consumed;
@@ -167,5 +175,6 @@ constexpr uint32_t kBrFailedReply             = _IO('r', 17);
 static_assert(sizeof(binder_write_read) == 48, "64-bit binder_write_read must be 48 bytes");
 static_assert(sizeof(binder_transaction_data) == 64, "64-bit binder_transaction_data must be 64 bytes");
 static_assert(sizeof(flat_binder_object) == 24, "64-bit flat_binder_object must be 24 bytes");
+static_assert(sizeof(binder_fd_array_object) == 32, "64-bit binder_fd_array_object must be 32 bytes");
 
 }  // namespace vguest::binder

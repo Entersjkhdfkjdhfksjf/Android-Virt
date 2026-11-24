@@ -263,6 +263,9 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
         const auto& ev = tq.front();
         if (out.size() + ev.bytes.size() > bwr.read_size) break;
         apply_fd_patches(ev);
+        if (ev.reply_to.tgid != 0) {
+            client.thread_reply_stacks[target_tid].push_back(ev.reply_to);
+        }
         out.insert(out.end(), ev.bytes.begin(), ev.bytes.end());
         tq.pop_front();
     }
@@ -420,8 +423,10 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     const size_t num_offs = offsets.size() / sizeof(binder::binder_size_t);
     std::vector<uint64_t> sg_guest_addrs(num_offs, 0);
     std::vector<size_t> sg_ring_offs(num_offs, 0);
+    std::vector<size_t> sg_ring_lens(num_offs, 0);
     std::vector<binder::binder_ptr_cookie> pending_node_refs;
     std::vector<std::pair<size_t, int>> raw_fd_patches;
+    std::vector<PendingFdPatch> fda_patches;
     constexpr uint32_t kBinderBufferFlagHasParent = 0x01;
 
     for (size_t i = 0; i < num_offs; ++i) {
@@ -451,6 +456,7 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
             bbo->buffer = child_guest_ptr;
             sg_guest_addrs[i] = child_guest_ptr;
             sg_ring_offs[i] = child_ring_off;
+            sg_ring_lens[i] = alloc_len;
 
             if ((bbo->flags & kBinderBufferFlagHasParent) != 0 &&
                 bbo->parent < i && sg_guest_addrs[bbo->parent] != 0) {
@@ -465,6 +471,29 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
             const auto* fdo = reinterpret_cast<const binder::binder_fd_object*>(payload.data() + obj_off);
             size_t fd_field_off = static_cast<size_t>(obj_off) + offsetof(binder::binder_fd_object, fd);
             raw_fd_patches.emplace_back(fd_field_off, static_cast<int>(fdo->fd));
+            continue;
+        }
+
+        if (obj_type == binder::kBinderTypeFda) {
+            if (obj_off + sizeof(binder::binder_fd_array_object) > payload.size()) continue;
+            const auto* fda = reinterpret_cast<const binder::binder_fd_array_object*>(payload.data() + obj_off);
+            if (fda->parent < i && sg_guest_addrs[fda->parent] != 0) {
+                size_t parent_ring_off = sg_ring_offs[fda->parent];
+                size_t parent_len = sg_ring_lens[fda->parent];
+                size_t num_fds = static_cast<size_t>(fda->num_fds);
+                size_t base_off = static_cast<size_t>(fda->parent_offset);
+                for (size_t k = 0; k < num_fds; ++k) {
+                    size_t rel_off = base_off + k * sizeof(uint32_t);
+                    if (rel_off + sizeof(uint32_t) > parent_len) break;
+                    size_t abs_ring_off = parent_ring_off + rel_off;
+                    if (abs_ring_off + sizeof(uint32_t) > kRxRingSize) break;
+                    int32_t sfd = -1;
+                    std::memcpy(&sfd, target.rx_map + abs_ring_off, sizeof(sfd));
+                    if (sfd >= 0) {
+                        fda_patches.push_back(PendingFdPatch{sender.pid, static_cast<int>(sfd), abs_ring_off});
+                    }
+                }
+            }
             continue;
         }
 
@@ -543,11 +572,15 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     out_tr.data.ptr.offsets = guest_offsets_ptr;
 
     std::vector<PendingFdPatch> fd_patches;
-    fd_patches.reserve(raw_fd_patches.size());
+    fd_patches.reserve(raw_fd_patches.size() + fda_patches.size());
     for (const auto& rf : raw_fd_patches) {
         fd_patches.push_back(PendingFdPatch{sender.pid, rf.second, payload_ring_off + rf.first});
     }
+    for (const auto& fp : fda_patches) {
+        fd_patches.push_back(fp);
+    }
 
+    pid_t nested_target_tid = 0;
     if (is_reply) {
         auto wit = target.waiting_reply_depth.find(target_reply_tid);
         if (wit != target.waiting_reply_depth.end() && wit->second > 0) {
@@ -560,9 +593,16 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
         if ((tr.flags & binder::kTfOneWay) == 0) {
             sender.waiting_reply_depth[sender_tid]++;
             rt = ReplyTarget{sender.pid, sender_tid};
+            // Re-entrant nested sync transaction (e.g. registerCallback -> onHotplug):
+            // route directly to the caller thread waiting on our reply to prevent deadlock.
+            auto rs_it = sender.thread_reply_stacks.find(sender_tid);
+            if (rs_it != sender.thread_reply_stacks.end() && !rs_it->second.empty() &&
+                rs_it->second.back().tgid == target.pid) {
+                nested_target_tid = rs_it->second.back().tid;
+            }
         }
-        push_br_payload(target, binder::kBrTransaction, &out_tr, sizeof(out_tr), 0, rt,
-                        std::move(fd_patches));
+        push_br_payload(target, binder::kBrTransaction, &out_tr, sizeof(out_tr),
+                        nested_target_tid, rt, std::move(fd_patches));
     }
 
     for (const auto& pc : pending_node_refs) {
@@ -572,6 +612,8 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     push_br_code(sender, binder::kBrTransactionComplete, sender_tid);
     if (is_reply && target_reply_tid != 0) {
         try_wake_parked_tid(target_reply_tid, out_wakes);
+    } else if (nested_target_tid != 0) {
+        try_wake_parked_tid(nested_target_tid, out_wakes);
     } else {
         try_wake_parked(target.pid, out_wakes);
     }
