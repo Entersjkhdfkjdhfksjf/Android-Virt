@@ -236,11 +236,13 @@ echo "=== [5/5] Cross-compiling arm64-v8a Graphics HALs ==="
 # Force NDK libc++ headers to emit AOSP's std::__1:: ABI namespace (not std::__ndk1::)
 cat > "${WORK}/aosp_libcpp_abi.h" <<'EOF'
 #pragma once
+#include <stdlib.h>
 #include <__config_site>
 #undef _LIBCPP_ABI_NAMESPACE
 #define _LIBCPP_ABI_NAMESPACE __1
+#define _LIBCPP_VERBOSE_ABORT(...) abort()
 EOF
-AOSP_STL_FLAGS=(-include "${WORK}/aosp_libcpp_abi.h" -fno-exceptions)
+AOSP_STL_FLAGS=(-include "${WORK}/aosp_libcpp_abi.h" -fno-exceptions -fno-rtti)
 
 # 1. VGuest Virtual HWC2 HAL (hwcomposer.virt.so — pure C HMI export, static STL)
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" -shared \
@@ -347,13 +349,13 @@ COMP_SRCS=$(find "${WORK}/hw-if/graphics/composer/2.1/utils"   -name '*.cpp' ! -
 
 "${STRIP}" --strip-unneeded "${OUT}"/*.so
 for f in libvguest_mapper20_impl.so libvguest_allocator20_svc.so libvguest_composer21_svc.so; do
-  if "${READELF}" -s "${OUT}/${f}" | grep -q "__ndk1"; then
-    echo "ERROR: ${f} still references NDK std::__ndk1 symbols!"
-    "${READELF}" -s "${OUT}/${f}" | grep "__ndk1" | head -n 10
+  if "${READELF}" -s "${OUT}/${f}" | grep -qE "UND.*(_ZTI|_ZTS|__ndk1|__libcpp_verbose_abort)"; then
+    echo "ERROR: ${f} still references NDK __ndk1 or RTTI _ZTI symbols!"
+    "${READELF}" -s "${OUT}/${f}" | grep -E "UND.*(_ZTI|_ZTS|__ndk1|__libcpp_verbose_abort)" | head -n 10
     exit 1
   fi
 done
-echo "Verified: ZERO __ndk1 symbols in AOSP-linked graphics HALs."
+echo "Verified: ZERO __ndk1 or RTTI _ZTI undefined symbols in AOSP-linked graphics HALs."
 ls -lh "${OUT}"/
 for f in "${OUT}"/*.so; do
   echo "--- DT_NEEDED for $(basename "$f") ---"
