@@ -80,7 +80,7 @@ jobs:
             https://android.googlesource.com/platform/external/swiftshader swiftshader-src
           git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
             https://android.googlesource.com/platform/system/core aosp-core && \
-            git -C aosp-core sparse-checkout set libcutils libsystem libsync include
+            git -C aosp-core sparse-checkout set libcutils libutils libsystem libsync include
           git clone --branch android-12.1.0_r27 --depth 1 --filter=blob:none --sparse \
             https://android.googlesource.com/platform/system/logging aosp-logging && \
             git -C aosp-logging sparse-checkout set liblog
@@ -140,7 +140,7 @@ jobs:
             -DSWIFTSHADER_WARNINGS_AS_ERRORS=OFF \
             -DCMAKE_CXX_FLAGS="-Wno-error -Wno-unused-but-set-variable -Wno-deprecated-declarations -DANDROID_PLATFORM_SDK_VERSION=31" \
             -DCMAKE_C_FLAGS="-Wno-error -DANDROID_PLATFORM_SDK_VERSION=31" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-L${PWD}/swiftshader-stubs -Wl,--no-as-needed -lhardware -lsync -lcutils -landroid -llog -Wl,--allow-shlib-undefined -Wl,--unresolved-symbols=ignore-all"
+            -DCMAKE_SHARED_LINKER_FLAGS="-L${PWD}/swiftshader-stubs -Wl,--no-as-needed -lhardware -lsync -lcutils -lutils -landroid -llog -Wl,--allow-shlib-undefined -Wl,--unresolved-symbols=ignore-all"
           cmake --build swiftshader-build --target gl_main -j$(nproc)
           cmake --build swiftshader-build --target libEGL libGLESv2 libGLES_CM -j$(nproc)
           mkdir -p swiftshader-out
@@ -148,11 +148,11 @@ jobs:
           cp $(find swiftshader-build -maxdepth 3 -name "libGLES*CM*.so" | head -n 1) swiftshader-out/libGLESv1_CM_swiftshader.so
           cp $(find swiftshader-build -maxdepth 3 -name "libGLESv2*.so" | head -n 1) swiftshader-out/libGLESv2_swiftshader.so
           "$STRIP" --strip-unneeded swiftshader-out/*.so
-          echo '=== Verifying SwiftShader EGL_ANDROID_image_native_buffer & DT_NEEDED ==='
+          echo '=== Verifying SwiftShader EGL_NATIVE_BUFFER_ANDROID & DT_NEEDED ==='
           "${READELF}" -d swiftshader-out/libEGL_swiftshader.so | grep NEEDED || true
-          strings swiftshader-out/libEGL_swiftshader.so | grep -E "EGL_ANDROID_image_native_buffer|hw_get_module" || true
-          if ! strings swiftshader-out/libEGL_swiftshader.so | grep -q "EGL_ANDROID_image_native_buffer"; then
-            echo "ERROR: libEGL_swiftshader.so still missing EGL_ANDROID_image_native_buffer!"
+          strings swiftshader-out/libEGL_swiftshader.so | grep -E "unsupported HAL format|hw_get_module" || true
+          if ! strings swiftshader-out/libEGL_swiftshader.so | grep -q "unsupported HAL format"; then
+            echo "ERROR: libEGL_swiftshader.so still missing EGL_NATIVE_BUFFER_ANDROID path!"
             exit 1
           fi
 
