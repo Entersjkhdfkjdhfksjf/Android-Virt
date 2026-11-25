@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -16,6 +17,13 @@
 #include "vfs_meta_format.hpp"
 
 namespace vguest {
+
+struct RuntimeStatMeta {
+    uid_t uid = 0;
+    gid_t gid = 0;
+    bool has_uid = false;
+    bool has_gid = false;
+};
 
 struct SupervisorConfig {
     std::string rootfs_root;
@@ -58,6 +66,7 @@ private:
 
     SupervisorConfig cfg_;
     VfsMetaDb meta_db_;
+    std::unordered_map<std::string, RuntimeStatMeta> runtime_meta_;
     PathTranslator translator_;
     PseudoFs pseudo_fs_;
     PropertyService prop_service_;

@@ -16,6 +16,7 @@
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <linux/stat.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/un.h>
@@ -644,7 +645,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7n-scm-ashmem\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7o-vchown-xattr\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -1085,7 +1086,79 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         }
         return;
     }
-    if (nr == SYS_setgroups || nr == SYS_capset || nr == SYS_fchownat || nr == SYS_fchown ||
+    if (nr == SYS_fchownat) {
+        int dirfd = static_cast<int>(regs.arg(0));
+        uid_t owner = static_cast<uid_t>(regs.arg(2));
+        gid_t group = static_cast<gid_t>(regs.arg(3));
+        int flags = static_cast<int>(regs.arg(4));
+        std::string raw_path;
+        std::string gpath;
+        if (read_guest_cstring(pid, regs.arg(1), raw_path)) {
+            if (raw_path.empty() && (flags & AT_EMPTY_PATH) != 0) {
+                char proc_fd[128];
+                std::snprintf(proc_fd, sizeof(proc_fd), "/proc/%d/fd/%d", static_cast<int>(pid), dirfd);
+                char link_buf[4096];
+                ssize_t n = ::readlink(proc_fd, link_buf, sizeof(link_buf) - 1);
+                if (n > 0) {
+                    link_buf[n] = '\0';
+                    gpath = translator_.host_to_guest(std::string_view(link_buf, static_cast<size_t>(n)));
+                }
+            } else {
+                bool follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
+                TranslatedPath tp = translator_.translate(pid, dirfd, raw_path, follow);
+                gpath = tp.guest_path;
+            }
+        }
+        if (!gpath.empty()) {
+            auto& rm = runtime_meta_[gpath];
+            if (owner != static_cast<uid_t>(-1)) {
+                rm.uid = owner;
+                rm.has_uid = true;
+            }
+            if (group != static_cast<gid_t>(-1)) {
+                rm.gid = group;
+                rm.has_gid = true;
+            }
+        }
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_fchown) {
+        int fd = static_cast<int>(regs.arg(0));
+        uid_t owner = static_cast<uid_t>(regs.arg(1));
+        gid_t group = static_cast<gid_t>(regs.arg(2));
+        char proc_fd[128];
+        std::snprintf(proc_fd, sizeof(proc_fd), "/proc/%d/fd/%d", static_cast<int>(pid), fd);
+        char link_buf[4096];
+        ssize_t n = ::readlink(proc_fd, link_buf, sizeof(link_buf) - 1);
+        if (n > 0) {
+            link_buf[n] = '\0';
+            std::string gpath = translator_.host_to_guest(std::string_view(link_buf, static_cast<size_t>(n)));
+            if (!gpath.empty()) {
+                auto& rm = runtime_meta_[gpath];
+                if (owner != static_cast<uid_t>(-1)) {
+                    rm.uid = owner;
+                    rm.has_uid = true;
+                }
+                if (group != static_cast<gid_t>(-1)) {
+                    rm.gid = group;
+                    rm.has_gid = true;
+                }
+            }
+        }
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_setxattr || nr == SYS_lsetxattr || nr == SYS_fsetxattr ||
+        nr == SYS_removexattr || nr == SYS_lremovexattr || nr == SYS_fremovexattr) {
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_getxattr || nr == SYS_lgetxattr || nr == SYS_fgetxattr) {
+        skip_with_ret(-ENODATA);
+        return;
+    }
+    if (nr == SYS_setgroups || nr == SYS_capset ||
         nr == SYS_mount || nr == SYS_umount2 || nr == SYS_chroot || nr == SYS_pivot_root ||
         nr == SYS_sethostname || nr == SYS_setdomainname || nr == SYS_unshare) {
         skip_with_ret(0);
@@ -1239,7 +1312,25 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         return;
     }
     if (nr == SYS_newfstatat) {
-        bool follow = (regs.arg(3) & AT_SYMLINK_NOFOLLOW) == 0;
+        int flags = static_cast<int>(regs.arg(3));
+        std::string raw_path;
+        if ((flags & AT_EMPTY_PATH) != 0 && read_guest_cstring(pid, regs.arg(1), raw_path) && raw_path.empty()) {
+            int fd = static_cast<int>(regs.arg(0));
+            char proc_fd[128];
+            std::snprintf(proc_fd, sizeof(proc_fd), "/proc/%d/fd/%d", static_cast<int>(pid), fd);
+            char link_buf[4096];
+            ssize_t n = ::readlink(proc_fd, link_buf, sizeof(link_buf) - 1);
+            std::string gpath;
+            if (n > 0) {
+                link_buf[n] = '\0';
+                gpath = translator_.host_to_guest(std::string_view(link_buf, static_cast<size_t>(n)));
+            }
+            proc.expecting_syscall_exit = true;
+            proc.exit_op = PendingExitOp{ExitPatchKind::kPatchStatBuf,
+                                         -1, 0, -1, 0, regs.arg(2), sizeof(struct stat), gpath, 0, ""};
+            return;
+        }
+        bool follow = (flags & AT_SYMLINK_NOFOLLOW) == 0;
         rewrite_path_arg(0, 1, follow, ExitPatchKind::kPatchStatBuf, regs.arg(2), sizeof(struct stat));
         return;
     }
@@ -1270,6 +1361,9 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
     }
     if (nr == SYS_unlinkat || nr == SYS_mkdirat || nr == SYS_fchmodat || nr == SYS_utimensat) {
         rewrite_path_arg(0, 1, false, ExitPatchKind::kRestoreRegOnly, 0, 0);
+        if (nr == SYS_unlinkat && !proc.exit_op.guest_path.empty()) {
+            runtime_meta_.erase(proc.exit_op.guest_path);
+        }
         return;
     }
     if (false
@@ -1343,7 +1437,7 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         }
 
         // Build scratch block below guest SP:
-        //   [linker_path ][target_bin_path ][8-byte aligned new_argv ptr array]
+        //   [linker_path\0][target_bin_path\0][8-byte aligned new_argv ptr array]
         std::string s_linker = interp_tp.host_path;
         s_linker.push_back('\0');
         TranslatedPath tp_nofollow = translator_.translate(pid, AT_FDCWD, raw_path, false);
@@ -1428,22 +1522,72 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
     if (op.kind == ExitPatchKind::kPatchStatBuf && op.out_buf_addr != 0) {
         struct stat st {};
         if (read_guest_mem(pid, op.out_buf_addr, &st, sizeof(st))) {
+            bool modified = false;
             if (op.guest_path.rfind("/dev/__properties__", 0) == 0) {
                 // Bionic prop_area::map_prop_area() strictly requires uid==0, gid==0, mode 0644
                 st.st_uid = 0;
                 st.st_gid = 0;
                 st.st_mode = (st.st_mode & S_IFMT) | 0644;
-                write_guest_mem(pid, op.out_buf_addr, &st, sizeof(st));
+                modified = true;
             } else {
                 auto meta = meta_db_.find(op.guest_path);
                 if (meta.has_value()) {
                     st.st_uid = meta->entry->uid;
                     st.st_gid = meta->entry->gid;
                     st.st_mode = (st.st_mode & S_IFMT) | (meta->entry->mode & 07777);
-                    write_guest_mem(pid, op.out_buf_addr, &st, sizeof(st));
+                    modified = true;
+                }
+                auto rit = runtime_meta_.find(op.guest_path);
+                if (rit != runtime_meta_.end()) {
+                    if (rit->second.has_uid) {
+                        st.st_uid = rit->second.uid;
+                        modified = true;
+                    }
+                    if (rit->second.has_gid) {
+                        st.st_gid = rit->second.gid;
+                        modified = true;
+                    }
                 }
             }
+            if (modified) {
+                write_guest_mem(pid, op.out_buf_addr, &st, sizeof(st));
+            }
         }
+    } else if (op.kind == ExitPatchKind::kPatchStatxBuf && op.out_buf_addr != 0) {
+#ifdef SYS_statx
+        struct statx stx {};
+        if (read_guest_mem(pid, op.out_buf_addr, &stx, sizeof(stx))) {
+            bool modified = false;
+            if (op.guest_path.rfind("/dev/__properties__", 0) == 0) {
+                stx.stx_uid = 0;
+                stx.stx_gid = 0;
+                stx.stx_mode = static_cast<uint16_t>((stx.stx_mode & S_IFMT) | 0644);
+                modified = true;
+            } else {
+                auto meta = meta_db_.find(op.guest_path);
+                if (meta.has_value()) {
+                    stx.stx_uid = meta->entry->uid;
+                    stx.stx_gid = meta->entry->gid;
+                    stx.stx_mode = static_cast<uint16_t>((stx.stx_mode & S_IFMT) | (meta->entry->mode & 07777));
+                    modified = true;
+                }
+                auto rit = runtime_meta_.find(op.guest_path);
+                if (rit != runtime_meta_.end()) {
+                    if (rit->second.has_uid) {
+                        stx.stx_uid = rit->second.uid;
+                        modified = true;
+                    }
+                    if (rit->second.has_gid) {
+                        stx.stx_gid = rit->second.gid;
+                        modified = true;
+                    }
+                }
+            }
+            if (modified) {
+                write_guest_mem(pid, op.out_buf_addr, &stx, sizeof(stx));
+            }
+        }
+#endif
     } else if (op.kind == ExitPatchKind::kStripRootfsGetcwd && op.out_buf_addr != 0) {
         std::string host_cwd;
         if (read_guest_cstring(pid, op.out_buf_addr, host_cwd, op.out_buf_len)) {
