@@ -25,6 +25,9 @@ struct GuestMemOps {
     std::function<bool(pid_t, uint64_t, const void*, size_t)> write;
     std::function<uint64_t(pid_t, const std::string&)> find_mmap_base;
     std::function<int(pid_t, int, pid_t)> dup_fd_into_target;
+    std::function<int(pid_t, pid_t, int)> grab_fd;
+    std::function<int(int, pid_t)> dup_held_fd_into_target;
+    std::function<void(int)> release_held_fd;
 };
 
 struct WakeEvent {
@@ -110,6 +113,7 @@ private:
     struct PendingFdPatch {
         pid_t sender_tgid = 0;
         int sender_fd = -1;
+        int held_fd = -1;
         size_t target_rx_off = 0;
     };
 

@@ -155,6 +155,9 @@ Supervisor::Supervisor(SupervisorConfig cfg)
                    [this](pid_t p, uint64_t a, const void* d, size_t l) { return write_guest_mem(p, a, d, l); },
                    [](pid_t p, const std::string& sub) { return find_guest_mmap_base(p, sub); },
                    [this](pid_t stgid, int sfd, pid_t ttid) { return dup_fd_into_target(stgid, sfd, ttid); },
+                   [this](pid_t stgid, pid_t stid, int sfd) { return grab_fd_from_sender(stgid, stid, sfd); },
+                   [this](int hfd, pid_t ttid) { return dup_held_fd_into_target(hfd, ttid); },
+                   [](int hfd) { if (hfd >= 0) ::close(hfd); },
                }),
       vinput_(cfg_.rootfs_root, 1400, 876,
               InputMemOps{[this](pid_t p, uint64_t a, const void* d, size_t l) {
@@ -177,6 +180,274 @@ uint64_t Supervisor::find_guest_mmap_base(pid_t pid, const std::string& path_sub
         }
     }
     return 0;
+}
+
+bool Supervisor::init_fd_relay() {
+    close_fd_relay();
+    ::mkdir((cfg_.rootfs_root + "/tmp").c_str(), 0777);
+    fd_relay_path_ = cfg_.rootfs_root + "/tmp/.vfd";
+    ::unlink(fd_relay_path_.c_str());
+    int s = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (s < 0) return false;
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    if (fd_relay_path_.size() >= sizeof(addr.sun_path)) {
+        ::close(s);
+        return false;
+    }
+    std::strncpy(addr.sun_path, fd_relay_path_.c_str(), sizeof(addr.sun_path) - 1);
+    if (::bind(s, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(s, 16) != 0) {
+        ::close(s);
+        return false;
+    }
+    ::chmod(fd_relay_path_.c_str(), 0666);
+    fd_relay_listen_fd_ = s;
+    return true;
+}
+
+void Supervisor::close_fd_relay() {
+    if (fd_relay_listen_fd_ >= 0) {
+        ::close(fd_relay_listen_fd_);
+        fd_relay_listen_fd_ = -1;
+    }
+    if (!fd_relay_path_.empty()) {
+        ::unlink(fd_relay_path_.c_str());
+    }
+}
+
+int64_t Supervisor::inject_syscall(pid_t tid, long sysno, uint64_t a0, uint64_t a1, uint64_t a2,
+                                   uint64_t a3, uint64_t a4, uint64_t a5) const {
+    ArchRegs saved;
+    if (!saved.load(tid)) return -ESRCH;
+
+    bool rewind_pc = (injected_stop_tids_.count(tid) > 0);
+    ArchRegs inj = saved;
+#if defined(__aarch64__)
+    if (rewind_pc) inj.r.pc -= 4;
+#elif defined(__x86_64__)
+    if (rewind_pc) inj.r.rip -= 2;
+#endif
+    inj.set_arg(0, a0);
+    inj.set_arg(1, a1);
+    inj.set_arg(2, a2);
+    inj.set_arg(3, a3);
+    inj.set_arg(4, a4);
+    inj.set_arg(5, a5);
+#if defined(__aarch64__)
+    inj.r.regs[8] = static_cast<uint64_t>(sysno);
+    inj.store(tid);
+    int nr = static_cast<int>(sysno);
+    struct iovec iov { &nr, sizeof(nr) };
+    ::ptrace(PTRACE_SETREGSET, tid, reinterpret_cast<void*>(NT_ARM_SYSTEM_CALL), &iov);
+#elif defined(__x86_64__)
+    inj.r.orig_rax = static_cast<uint64_t>(sysno);
+    inj.r.rax = static_cast<uint64_t>(sysno);
+    inj.store(tid);
+#endif
+
+    ::ptrace(PTRACE_SYSCALL, tid, nullptr, nullptr);
+    int st = 0;
+    int64_t retval = -EIO;
+    bool expecting_entry = rewind_pc;
+    while (::waitpid(tid, &st, __WALL) > 0) {
+        if (!WIFSTOPPED(st)) break;
+        int s = WSTOPSIG(st);
+        if (s == (SIGTRAP | 0x80)) {
+            if (expecting_entry) {
+                expecting_entry = false;
+                ::ptrace(PTRACE_SYSCALL, tid, nullptr, nullptr);
+                continue;
+            }
+            ArchRegs out;
+            if (out.load(tid)) retval = out.ret();
+            break;
+        }
+        ::ptrace(PTRACE_SYSCALL, tid, nullptr, nullptr);
+    }
+
+    injected_stop_tids_.insert(tid);
+    saved.store(tid);
+    return retval;
+}
+
+int Supervisor::scm_grab_fd(pid_t sender_tid, int sender_fd) const {
+    if (fd_relay_listen_fd_ < 0 || sender_tid <= 0 || sender_fd < 0) return -1;
+    ArchRegs saved;
+    if (!saved.load(sender_tid)) return -1;
+
+    int64_t gs = inject_syscall(sender_tid, SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0);
+    if (gs < 0) return -1;
+
+    struct RelayBlob {
+        struct sockaddr_un addr;
+        struct msghdr msg;
+        struct iovec iov;
+        char dummy;
+        char pad[7];
+        union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } cmsg_u;
+    };
+    uint64_t scratch = scratch_addr_below_sp(saved.sp(), sizeof(RelayBlob));
+    RelayBlob blob {};
+    blob.addr.sun_family = AF_UNIX;
+    std::strncpy(blob.addr.sun_path, fd_relay_path_.c_str(), sizeof(blob.addr.sun_path) - 1);
+    blob.dummy = 'F';
+    blob.iov.iov_base = reinterpret_cast<void*>(scratch + offsetof(RelayBlob, dummy));
+    blob.iov.iov_len = 1;
+    blob.msg.msg_iov = reinterpret_cast<struct iovec*>(scratch + offsetof(RelayBlob, iov));
+    blob.msg.msg_iovlen = 1;
+    blob.msg.msg_control = reinterpret_cast<void*>(scratch + offsetof(RelayBlob, cmsg_u));
+    blob.msg.msg_controllen = sizeof(blob.cmsg_u.buf);
+    auto* cm = reinterpret_cast<struct cmsghdr*>(blob.cmsg_u.buf);
+    cm->cmsg_len = CMSG_LEN(sizeof(int));
+    cm->cmsg_level = SOL_SOCKET;
+    cm->cmsg_type = SCM_RIGHTS;
+    std::memcpy(CMSG_DATA(cm), &sender_fd, sizeof(int));
+
+    int held = -1;
+    if (write_guest_mem(sender_tid, scratch, &blob, sizeof(blob))) {
+        int64_t crc = inject_syscall(sender_tid, SYS_connect, static_cast<uint64_t>(gs),
+                                     scratch + offsetof(RelayBlob, addr), sizeof(blob.addr), 0, 0, 0);
+        if (crc == 0) {
+            int conn = ::accept4(fd_relay_listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
+            if (conn >= 0) {
+                int64_t src = inject_syscall(sender_tid, SYS_sendmsg, static_cast<uint64_t>(gs),
+                                             scratch + offsetof(RelayBlob, msg), 0, 0, 0, 0);
+                if (src > 0) {
+                    char rch = 0;
+                    struct iovec riov { &rch, 1 };
+                    union {
+                        char buf[CMSG_SPACE(sizeof(int))];
+                        struct cmsghdr align;
+                    } rcmsg_u {};
+                    struct msghdr rmsg {};
+                    rmsg.msg_iov = &riov;
+                    rmsg.msg_iovlen = 1;
+                    rmsg.msg_control = rcmsg_u.buf;
+                    rmsg.msg_controllen = sizeof(rcmsg_u.buf);
+                    if (::recvmsg(conn, &rmsg, MSG_CMSG_CLOEXEC) > 0) {
+                        struct cmsghdr* rcm = CMSG_FIRSTHDR(&rmsg);
+                        if (rcm && rcm->cmsg_level == SOL_SOCKET && rcm->cmsg_type == SCM_RIGHTS) {
+                            std::memcpy(&held, CMSG_DATA(rcm), sizeof(int));
+                        }
+                    }
+                }
+                ::close(conn);
+            }
+        }
+    }
+    (void)inject_syscall(sender_tid, SYS_close, static_cast<uint64_t>(gs), 0, 0, 0, 0, 0);
+    return held;
+}
+
+int Supervisor::scm_send_fd(pid_t target_tid, int held_fd) const {
+    if (fd_relay_listen_fd_ < 0 || target_tid <= 0 || held_fd < 0) return -1;
+    ArchRegs saved;
+    if (!saved.load(target_tid)) return -1;
+
+    int64_t gs = inject_syscall(target_tid, SYS_socket, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, 0, 0, 0);
+    if (gs < 0) return -1;
+
+    struct RelayBlob {
+        struct sockaddr_un addr;
+        struct msghdr msg;
+        struct iovec iov;
+        char dummy;
+        char pad[7];
+        union {
+            char buf[CMSG_SPACE(sizeof(int))];
+            struct cmsghdr align;
+        } cmsg_u;
+    };
+    uint64_t scratch = scratch_addr_below_sp(saved.sp(), sizeof(RelayBlob));
+    RelayBlob blob {};
+    blob.addr.sun_family = AF_UNIX;
+    std::strncpy(blob.addr.sun_path, fd_relay_path_.c_str(), sizeof(blob.addr.sun_path) - 1);
+    blob.iov.iov_base = reinterpret_cast<void*>(scratch + offsetof(RelayBlob, dummy));
+    blob.iov.iov_len = 1;
+    blob.msg.msg_iov = reinterpret_cast<struct iovec*>(scratch + offsetof(RelayBlob, iov));
+    blob.msg.msg_iovlen = 1;
+    blob.msg.msg_control = reinterpret_cast<void*>(scratch + offsetof(RelayBlob, cmsg_u));
+    blob.msg.msg_controllen = sizeof(blob.cmsg_u.buf);
+
+    int new_fd = -1;
+    if (write_guest_mem(target_tid, scratch, &blob, sizeof(blob))) {
+        int64_t crc = inject_syscall(target_tid, SYS_connect, static_cast<uint64_t>(gs),
+                                     scratch + offsetof(RelayBlob, addr), sizeof(blob.addr), 0, 0, 0);
+        if (crc == 0) {
+            int conn = ::accept4(fd_relay_listen_fd_, nullptr, nullptr, SOCK_CLOEXEC);
+            if (conn >= 0) {
+                char sch = 'R';
+                struct iovec siov { &sch, 1 };
+                union {
+                    char buf[CMSG_SPACE(sizeof(int))];
+                    struct cmsghdr align;
+                } scmsg_u {};
+                struct msghdr smsg {};
+                smsg.msg_iov = &siov;
+                smsg.msg_iovlen = 1;
+                smsg.msg_control = scmsg_u.buf;
+                smsg.msg_controllen = sizeof(scmsg_u.buf);
+                struct cmsghdr* scm = CMSG_FIRSTHDR(&smsg);
+                scm->cmsg_len = CMSG_LEN(sizeof(int));
+                scm->cmsg_level = SOL_SOCKET;
+                scm->cmsg_type = SCM_RIGHTS;
+                std::memcpy(CMSG_DATA(scm), &held_fd, sizeof(int));
+                if (::sendmsg(conn, &smsg, 0) > 0) {
+                    int64_t rrc = inject_syscall(target_tid, SYS_recvmsg, static_cast<uint64_t>(gs),
+                                                 scratch + offsetof(RelayBlob, msg), MSG_CMSG_CLOEXEC, 0, 0, 0);
+                    if (rrc > 0) {
+                        RelayBlob out_blob {};
+                        if (read_guest_mem(target_tid, scratch, &out_blob, sizeof(out_blob))) {
+                            auto* rcm = reinterpret_cast<struct cmsghdr*>(out_blob.cmsg_u.buf);
+                            if (rcm->cmsg_level == SOL_SOCKET && rcm->cmsg_type == SCM_RIGHTS) {
+                                std::memcpy(&new_fd, CMSG_DATA(rcm), sizeof(int));
+                            }
+                        }
+                    }
+                }
+                ::close(conn);
+            }
+        }
+    }
+    (void)inject_syscall(target_tid, SYS_close, static_cast<uint64_t>(gs), 0, 0, 0, 0, 0);
+    return new_fd;
+}
+
+int Supervisor::grab_fd_from_sender(pid_t sender_tgid, pid_t sender_tid, int sender_fd) const {
+    if (sender_tgid <= 0 || sender_fd < 0) return -1;
+    std::string proc_path = "/proc/" + std::to_string(static_cast<int>(sender_tgid)) +
+                            "/fd/" + std::to_string(sender_fd);
+    int fd = ::open(proc_path.c_str(), O_RDWR | O_CLOEXEC);
+    if (fd < 0 && (errno == EACCES || errno == EROFS)) {
+        fd = ::open(proc_path.c_str(), O_RDONLY | O_CLOEXEC);
+    }
+    if (fd >= 0) return fd;
+    return scm_grab_fd(sender_tid, sender_fd);
+}
+
+int Supervisor::dup_held_fd_into_target(int held_fd, pid_t target_tid) const {
+    if (held_fd < 0 || target_tid <= 0) return -1;
+    ArchRegs saved;
+    if (!saved.load(target_tid)) return -1;
+
+    std::string proc_path = "/proc/" + std::to_string(static_cast<int>(::getpid())) +
+                            "/fd/" + std::to_string(held_fd);
+    proc_path.push_back('\0');
+    uint64_t scratch = scratch_addr_below_sp(saved.sp(), proc_path.size());
+    if (write_guest_mem(target_tid, scratch, proc_path.data(), proc_path.size())) {
+        int64_t nfd = inject_syscall(target_tid, SYS_openat, static_cast<uint64_t>(AT_FDCWD),
+                                     scratch, static_cast<uint64_t>(O_RDWR | O_CLOEXEC), 0, 0, 0);
+        if (nfd == -EACCES || nfd == -EROFS) {
+            nfd = inject_syscall(target_tid, SYS_openat, static_cast<uint64_t>(AT_FDCWD),
+                                 scratch, static_cast<uint64_t>(O_RDONLY | O_CLOEXEC), 0, 0, 0);
+        }
+        if (nfd >= 0) return static_cast<int>(nfd);
+    }
+    return scm_send_fd(target_tid, held_fd);
 }
 
 int Supervisor::dup_fd_into_target(pid_t sender_tgid, int sender_fd, pid_t target_tid) const {
@@ -340,6 +611,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     ::prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0);
 
     (void)logd_.start();
+    (void)init_fd_relay();
     (void)vinput_.start();
 
     if (cfg_.enable_property_service) {
@@ -367,7 +639,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7j-hwbinder-reply\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7k-fd-relay\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -491,6 +763,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     vinput_.stop();
+    close_fd_relay();
     logd_.stop();
     prop_service_.stop();
     return rc;
@@ -506,6 +779,7 @@ void Supervisor::wake_parked_binder_threads(const std::vector<WakeEvent>& wakes)
         }
         auto& wproc = registry_.get_or_create(w.pid, cfg_.initial_creds);
         wproc.parked_in_binder = false;
+        injected_stop_tids_.erase(w.pid);
         ::ptrace(PTRACE_CONT, w.pid, nullptr, nullptr);
     }
 }
@@ -570,6 +844,7 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
                 // Intentionally parked until a peer sends BR_TRANSACTION/BR_REPLY
                 continue;
             }
+            injected_stop_tids_.erase(pid);
             if (proc.expecting_syscall_exit) {
                 ::ptrace(PTRACE_SYSCALL, pid, nullptr, nullptr);
             } else {

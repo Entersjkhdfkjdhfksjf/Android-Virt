@@ -248,9 +248,15 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
 
     std::vector<uint8_t> out;
     auto apply_fd_patches = [&](const PendingBrEvent& ev) {
-        if (ev.fd_patches.empty() || !client.rx_map || !mem_ops_.dup_fd_into_target) return;
+        if (ev.fd_patches.empty() || !client.rx_map) return;
         for (const auto& fp : ev.fd_patches) {
-            int new_fd = mem_ops_.dup_fd_into_target(fp.sender_tgid, fp.sender_fd, target_tid);
+            int new_fd = -1;
+            if (fp.held_fd >= 0 && mem_ops_.dup_held_fd_into_target) {
+                new_fd = mem_ops_.dup_held_fd_into_target(fp.held_fd, target_tid);
+                if (mem_ops_.release_held_fd) mem_ops_.release_held_fd(fp.held_fd);
+            } else if (mem_ops_.dup_fd_into_target) {
+                new_fd = mem_ops_.dup_fd_into_target(fp.sender_tgid, fp.sender_fd, target_tid);
+            }
             if (new_fd >= 0 && fp.target_rx_off + sizeof(uint32_t) <= kRxRingSize) {
                 uint32_t ufd = static_cast<uint32_t>(new_fd);
                 std::memcpy(client.rx_map + fp.target_rx_off, &ufd, sizeof(ufd));
@@ -525,7 +531,8 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
                     int32_t sfd = -1;
                     std::memcpy(&sfd, target.rx_map + abs_ring_off, sizeof(sfd));
                     if (sfd >= 0) {
-                        fda_patches.push_back(PendingFdPatch{sender.pid, static_cast<int>(sfd), abs_ring_off});
+                        int held = mem_ops_.grab_fd ? mem_ops_.grab_fd(sender.pid, sender_tid, static_cast<int>(sfd)) : -1;
+                        fda_patches.push_back(PendingFdPatch{sender.pid, static_cast<int>(sfd), held, abs_ring_off});
                     }
                 }
             }
@@ -610,7 +617,8 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
     std::vector<PendingFdPatch> fd_patches;
     fd_patches.reserve(raw_fd_patches.size() + fda_patches.size());
     for (const auto& rf : raw_fd_patches) {
-        fd_patches.push_back(PendingFdPatch{sender.pid, rf.second, payload_ring_off + rf.first});
+        int held = mem_ops_.grab_fd ? mem_ops_.grab_fd(sender.pid, sender_tid, rf.second) : -1;
+        fd_patches.push_back(PendingFdPatch{sender.pid, rf.second, held, payload_ring_off + rf.first});
     }
     for (const auto& fp : fda_patches) {
         fd_patches.push_back(fp);
