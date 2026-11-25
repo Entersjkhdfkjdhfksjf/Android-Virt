@@ -470,6 +470,20 @@ bool BootSequencer::provision_vintf_manifest() const {
         }
     }
 
+    // Remove unstarted VINTF manifest fragments (e.g., Redroid's power/lights/sensors lazy AIDL XMLs)
+    // so servicemanager doesn't block forever trying to lazy-start HALs we haven't launched.
+    {
+        std::string frag_dir = rootfs_root_ + "/vendor/etc/vintf/manifest";
+        if (DIR* fd = ::opendir(frag_dir.c_str())) {
+            while (struct dirent* ent = ::readdir(fd)) {
+                std::string name = ent->d_name;
+                if (name == "." || name == "..") continue;
+                std::remove((frag_dir + "/" + name).c_str());
+            }
+            ::closedir(fd);
+        }
+    }
+
     std::ofstream out(rootfs_root_ + "/vendor/etc/vintf/manifest.xml", std::ios::trunc);
     if (!out.is_open()) return false;
     out << kManifestXml;

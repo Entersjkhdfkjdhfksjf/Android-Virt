@@ -298,17 +298,23 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
     }
 
     // Only pull process-wide transactions/refcounts if this thread isn't actively blocked
-    // waiting for a synchronous BR_REPLY.
+    // waiting for a synchronous BR_REPLY. Deliver at most ONE BR_TRANSACTION per ioctl
+    // (matching Linux binder.c) so thread_reply_stacks never mixes up concurrent callers.
     if (!is_waiting_reply) {
         while (!client.inbox.empty()) {
             const auto& ev = client.inbox.front();
             if (out.size() + ev.bytes.size() > bwr.read_size) break;
+            uint32_t ev_cmd = 0;
+            if (ev.bytes.size() >= sizeof(uint32_t)) {
+                std::memcpy(&ev_cmd, ev.bytes.data(), sizeof(uint32_t));
+            }
             apply_fd_patches(ev);
             if (ev.reply_to.tgid != 0) {
                 client.thread_reply_stacks[target_tid].push_back(ev.reply_to);
             }
             out.insert(out.end(), ev.bytes.begin(), ev.bytes.end());
             client.inbox.pop_front();
+            if (ev_cmd == binder::kBrTransaction) break;
         }
     }
 
@@ -353,7 +359,7 @@ void VBinderBroker::try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& o
             if (pit->second.tgid != target_tgid) continue;
             ParkedWaiter waiter = pit->second;
             ClientState* client = find_client(waiter.tgid, waiter.fd);
-            if (!client) return;
+            if (!client) continue;
 
             auto wit = client->waiting_reply_depth.find(waiter.pid);
             bool is_waiting = (wit != client->waiting_reply_depth.end() && wit->second > 0);
@@ -365,15 +371,16 @@ void VBinderBroker::try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& o
                                    &waiter.epoll_ev, sizeof(waiter.epoll_ev));
                     parked_.erase(pit);
                     out_wakes.push_back(WakeEvent{waiter.pid, 1});
+                    return;
                 }
-                return;
+                continue;
             }
 
             if (flush_inbox_to_guest(*client, waiter.pid, waiter.bwr_addr, waiter.bwr)) {
                 parked_.erase(pit);
                 out_wakes.push_back(WakeEvent{waiter.pid, 0});
+                return;
             }
-            return;
         }
     }
 }
