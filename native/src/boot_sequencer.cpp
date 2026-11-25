@@ -307,6 +307,88 @@ bool BootSequencer::provision_vintf_manifest() const {
 </manifest>
 )XML";
 
+    // If /linkerconfig/ld.config.txt is missing or empty (e.g., Docker-exported Redroid rootfs),
+    // synthesize a complete AOSP 12 linkerconfig with all APEX + system + sphal namespaces.
+    {
+        std::string ld_dir = rootfs_root_ + "/linkerconfig";
+        ::mkdir(ld_dir.c_str(), 0755);
+        std::string ld_path = ld_dir + "/ld.config.txt";
+        struct stat ld_st {};
+        if (::stat(ld_path.c_str(), &ld_st) != 0 || ld_st.st_size < 64) {
+            std::vector<std::pair<std::string, std::string>> apex_ns; // (ns_name, dir_name)
+            std::string common_paths =
+                "/system/lib64:/system_ext/lib64:/product/lib64:/vendor/lib64:/vendor/lib64/hw:/vendor/lib64/egl";
+            if (DIR* ad = ::opendir((rootfs_root_ + "/apex").c_str())) {
+                while (struct dirent* ent = ::readdir(ad)) {
+                    std::string name = ent->d_name;
+                    if (name == "." || name == ".." || name.find('@') != std::string::npos) continue;
+                    std::string ns = name;
+                    for (char& ch : ns) {
+                        if (ch == '.' || ch == '-') ch = '_';
+                    }
+                    apex_ns.emplace_back(ns, name);
+                    common_paths += ":/apex/" + name + "/lib64";
+                    if (name == "com.android.runtime") {
+                        common_paths += ":/apex/com.android.runtime/lib64/bionic";
+                    }
+                }
+                ::closedir(ad);
+            }
+            std::string add_ns = "system,sphal,vndk";
+            for (const auto& [ns, _] : apex_ns) {
+                add_ns += "," + ns;
+            }
+            std::ostringstream cfg;
+            cfg << "dir.system = /system/bin\n"
+                << "dir.system = /system_ext/bin\n"
+                << "dir.system = /product/bin\n"
+                << "dir.system = /apex/com.android.art/bin\n"
+                << "dir.system = /apex/com.android.runtime/bin\n"
+                << "dir.vendor = /vendor/bin\n"
+                << "dir.vendor = /vendor/bin/hw\n\n"
+                << "[system]\n"
+                << "additional.namespaces = " << add_ns << "\n"
+                << "namespace.default.isolated = false\n"
+                << "namespace.default.search.paths = " << common_paths << "\n"
+                << "namespace.default.permitted.paths = /system:/system_ext:/product:/vendor:/apex:/data\n"
+                << "namespace.default.links = " << add_ns << "\n"
+                << "namespace.default.link.system.allow_all_shared_libs = true\n"
+                << "namespace.default.link.sphal.allow_all_shared_libs = true\n"
+                << "namespace.default.link.vndk.allow_all_shared_libs = true\n";
+            for (const auto& [ns, _] : apex_ns) {
+                cfg << "namespace.default.link." << ns << ".allow_all_shared_libs = true\n";
+            }
+            auto emit_ns = [&](const std::string& ns, const std::string& extra_path) {
+                cfg << "\nnamespace." << ns << ".isolated = false\n"
+                    << "namespace." << ns << ".visible = true\n"
+                    << "namespace." << ns << ".search.paths = "
+                    << (extra_path.empty() ? common_paths : (extra_path + ":" + common_paths)) << "\n"
+                    << "namespace." << ns << ".permitted.paths = /system:/system_ext:/product:/vendor:/apex:/data\n"
+                    << "namespace." << ns << ".links = default\n"
+                    << "namespace." << ns << ".link.default.allow_all_shared_libs = true\n";
+            };
+            emit_ns("system", "");
+            emit_ns("sphal", "/vendor/lib64/egl:/vendor/lib64/hw:/vendor/lib64");
+            emit_ns("vndk", "/system/lib64/vndk-31:/system/lib64/vndk-sp-31");
+            for (const auto& [ns, dir_name] : apex_ns) {
+                emit_ns(ns, "/apex/" + dir_name + "/lib64");
+            }
+            cfg << "\n[vendor]\n"
+                << "additional.namespaces = system,sphal\n"
+                << "namespace.default.isolated = false\n"
+                << "namespace.default.search.paths = /vendor/lib64:/vendor/lib64/hw:/vendor/lib64/egl:" << common_paths << "\n"
+                << "namespace.default.permitted.paths = /vendor:/system:/system_ext:/product:/apex:/data\n"
+                << "namespace.default.links = system,sphal\n"
+                << "namespace.default.link.system.allow_all_shared_libs = true\n"
+                << "namespace.default.link.sphal.allow_all_shared_libs = true\n";
+            emit_ns("system", "");
+            emit_ns("sphal", "/vendor/lib64/egl:/vendor/lib64/hw:/vendor/lib64");
+
+            std::ofstream lout(ld_path, std::ios::trunc);
+            lout << cfg.str();
+        }
+    }
+
     // Ensure /linkerconfig/ld.config.txt exports a visible `system` namespace for libart OAT loading
     {
         std::string ld_path = rootfs_root_ + "/linkerconfig/ld.config.txt";
