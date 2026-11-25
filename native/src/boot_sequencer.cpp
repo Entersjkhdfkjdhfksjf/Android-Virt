@@ -295,15 +295,6 @@ bool BootSequencer::provision_vintf_manifest() const {
             <instance>default</instance>
         </interface>
     </hal>
-    <hal format="hidl">
-        <name>android.hardware.health</name>
-        <transport>hwbinder</transport>
-        <version>2.1</version>
-        <interface>
-            <name>IHealth</name>
-            <instance>default</instance>
-        </interface>
-    </hal>
 </manifest>
 )XML";
 
@@ -484,9 +475,43 @@ bool BootSequencer::provision_vintf_manifest() const {
         }
     }
 
+    bool has_health_svc = false;
+    for (const char* d : {"/vendor/bin/hw", "/system/bin/hw"}) {
+        if (DIR* hd = ::opendir((rootfs_root_ + d).c_str())) {
+            while (struct dirent* ent = ::readdir(hd)) {
+                std::string name = ent->d_name;
+                if (name.rfind("android.hardware.health@2.", 0) == 0 &&
+                    name.find("-service") != std::string::npos) {
+                    has_health_svc = true;
+                    break;
+                }
+            }
+            ::closedir(hd);
+        }
+        if (has_health_svc) break;
+    }
+
+    std::string manifest_str = kManifestXml;
+    if (has_health_svc) {
+        const std::string health_hal =
+            "    <hal format=\"hidl\">\n"
+            "        <name>android.hardware.health</name>\n"
+            "        <transport>hwbinder</transport>\n"
+            "        <version>2.1</version>\n"
+            "        <interface>\n"
+            "            <name>IHealth</name>\n"
+            "            <instance>default</instance>\n"
+            "        </interface>\n"
+            "    </hal>\n</manifest>";
+        size_t pos = manifest_str.rfind("</manifest>");
+        if (pos != std::string::npos) {
+            manifest_str.replace(pos, 11, health_hal);
+        }
+    }
+
     std::ofstream out(rootfs_root_ + "/vendor/etc/vintf/manifest.xml", std::ios::trunc);
     if (!out.is_open()) return false;
-    out << kManifestXml;
+    out << manifest_str;
     return out.good();
 }
 
@@ -534,7 +559,7 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "if [ -x /vendor/bin/hw/android.hardware.graphics.composer@2.1-service ]; then /vendor/bin/hw/android.hardware.graphics.composer@2.1-service & P_COMP=$!; fi\n"
         "if [ -x /system/bin/installd ]; then /system/bin/installd & P_INST=$!; fi\n"
         "if [ -x /system/bin/idmap2d ]; then /system/bin/idmap2d & P_IDMAP=$!; fi\n"
-        "if [ -x /system/bin/keystore2 ]; then /system/bin/keystore2 /data/misc/keystore & P_KS=$!; fi\n"
+        "for hsvc in /vendor/bin/hw/android.hardware.health@2.*-service* /system/bin/hw/android.hardware.health@2.*-service*; do if [ -x \"$hsvc\" ]; then \"$hsvc\" & P_HLTH=$!; break; fi; done\n"
         "sleep 1\n"
         "if [ -x /system/bin/surfaceflinger ]; then /system/bin/surfaceflinger & P_SF=$!; fi\n"
         "sleep 1\n"
@@ -559,7 +584,7 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "    kill $P_TK 2>/dev/null || true\n"
         "  fi\n"
         "done\n"
-        "kill $P_ANIM $P_ZYG $P_SF $P_COMP $P_ALLOC $P_INST $P_IDMAP $P_KS $P_SUSP $P_SM $P_HW $P_VND 2>/dev/null || true\n";
+        "kill $P_ANIM $P_ZYG $P_SF $P_COMP $P_ALLOC $P_INST $P_IDMAP $P_HLTH $P_SUSP $P_SM $P_HW $P_VND 2>/dev/null || true\n";
 }
 
 }  // namespace vguest
