@@ -402,7 +402,8 @@ void PropertyService::seed_default_aosp12_properties() {
         {"ro.crypto.state", "unencrypted"},
         {"ro.debuggable", "1"},
         {"ro.secure", "0"},
-        {"debug.sf.nobootanimation", "1"},
+        {"debug.sf.nobootanimation", "0"},
+        {"service.bootanim.exit", "0"},
         {"ro.setupwizard.mode", "DISABLED"},
         {"sys.boot_completed", "0"},
     };
