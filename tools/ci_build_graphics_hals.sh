@@ -46,7 +46,7 @@ clone_sparse() {
 [ -d libhidl ]    || git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libhidl libhidl
 [ -d libhwbinder ]|| git clone --branch "${TAG}" --depth 1 https://android.googlesource.com/platform/system/libhwbinder libhwbinder
 clone_sparse https://android.googlesource.com/platform/system/core core libcutils libutils libsystem libsync include
-clone_sparse https://android.googlesource.com/platform/frameworks/native native libs/nativewindow libs/nativebase libs/arect libs/ui libs/gralloc include
+clone_sparse https://android.googlesource.com/platform/frameworks/native native libs/nativewindow libs/nativebase libs/arect libs/ui libs/gralloc libs/binder include
 clone_sparse https://android.googlesource.com/platform/hardware/interfaces hw-if graphics/common graphics/allocator/2.0 graphics/mapper graphics/composer/2.1
 clone_sparse https://android.googlesource.com/platform/system/hardware/interfaces sys-hw-if suspend/1.0
 
@@ -164,6 +164,7 @@ void __vguest_stub(void) {}
 EOF
 
 for lib in \
+  libbinder.so \
   libhidlbase.so \
   libfmq.so \
   libhardware.so \
@@ -210,6 +211,7 @@ AOSP_INCS=(
   -I"${WORK}/native/libs/nativebase/include"
   -I"${WORK}/native/libs/arect/include"
   -I"${WORK}/native/libs/ui/include"
+  -I"${WORK}/native/libs/binder/include"
   -I"${WORK}/native/libs/gralloc/types/include"
   -I"${WORK}/hw-if/graphics/mapper/2.0/utils/passthrough/include"
   -I"${WORK}/hw-if/graphics/mapper/2.0/utils/hal/include"
@@ -374,10 +376,21 @@ cat > "${WORK}/suspend_service_main.cpp" <<'CPPEOF'
 #define LOG_TAG "VGuestSuspend"
 #include <android/system/suspend/1.0/ISystemSuspend.h>
 #include <android/system/suspend/1.0/IWakeLock.h>
+#include <binder/Binder.h>
+#include <binder/IServiceManager.h>
+#include <binder/Parcel.h>
+#include <binder/ProcessState.h>
 #include <hidl/HidlTransportSupport.h>
 #include <log/log.h>
+#include <utils/String16.h>
 
+using android::BBinder;
+using android::Parcel;
+using android::ProcessState;
+using android::String16;
+using android::defaultServiceManager;
 using android::sp;
+using android::status_t;
 using android::hardware::Return;
 using android::hardware::Void;
 using android::hardware::configureRpcThreadpool;
@@ -397,7 +410,40 @@ struct VGuestSystemSuspend : public ISystemSuspend {
     }
 };
 
+class VGuestSuspendControlBinder : public BBinder {
+public:
+    explicit VGuestSuspendControlBinder(bool is_internal) : is_internal_(is_internal) {}
+    status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) override {
+        if (code == android::IBinder::INTERFACE_TRANSACTION) {
+            reply->writeString16(String16(is_internal_
+                ? "android.system.suspend.internal.ISuspendControlServiceInternal"
+                : "android.system.suspend.ISuspendControlService"));
+            return android::OK;
+        }
+        if (code >= android::IBinder::FIRST_CALL_TRANSACTION && code <= android::IBinder::LAST_CALL_TRANSACTION) {
+            (void)data;
+            if (reply) {
+                reply->writeInt32(0);  // binder::Status::EX_NONE
+                // code 1 is registerCallback / enableAutosuspend -> return true; others -> 0/false/empty vec
+                reply->writeInt32(code == 1 ? 1 : 0);
+            }
+            return android::OK;
+        }
+        return BBinder::onTransact(code, data, reply, flags);
+    }
+private:
+    bool is_internal_;
+};
+
 int main() {
+    ProcessState::self()->startThreadPool();
+    auto sm = defaultServiceManager();
+    if (sm != nullptr) {
+        sm->addService(String16("suspend_control"), new VGuestSuspendControlBinder(false));
+        sm->addService(String16("suspend_control_internal"), new VGuestSuspendControlBinder(true));
+        ALOGI("VGuest suspend@1.0: registered suspend_control + suspend_control_internal");
+    }
+
     configureRpcThreadpool(2, true /* callerWillJoin */);
     sp<ISystemSuspend> svc(new VGuestSystemSuspend());
     if (svc->registerAsService() != android::OK) {
@@ -413,7 +459,7 @@ CPPEOF
 "${CXX_ARM64}" "${COMMON_CXXFLAGS[@]}" "${AOSP_STL_FLAGS[@]}" -fPIE -pie \
   "${WORK}/suspend_service_main.cpp" "${WORK}/aosp_libcpp_compat.cpp" \
   "${LINK_FLAGS[@]}" \
-  -lhidlbase -lutils -lcutils -llog -lbase -lc++ \
+  -lbinder -lhidlbase -lutils -lcutils -llog -lbase -lc++ \
   "${STUBS}/android.system.suspend@1.0.so" \
   -o "${OUT}/libvguest_suspend_svc.so"
 

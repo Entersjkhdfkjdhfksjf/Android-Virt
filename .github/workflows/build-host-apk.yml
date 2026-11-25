@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: swiftshader-out
-          key: swiftshader-gles-arm64-v8a-llvm-r3
+          key: swiftshader-gles-arm64-v8a-llvm-r4
 
       - name: Build SwiftShader OpenGL ES (arm64-v8a)
         if: steps.cache-swiftshader.outputs.cache-hit != 'true'
@@ -125,6 +125,15 @@ jobs:
           if dbg_cpp.exists():
               dbg_cpp.write_text(dbg_cpp.read_text() + "\nvoid AndroidEnterDebugger() {}\n")
               print("Added AndroidEnterDebugger() stub to debug.cpp")
+          # Ensure GrallocModule.cpp is compiled into libGLESCommon / libEGL
+          gralloc_cpps = [str(p.relative_to(root)) for p in root.rglob("*.cpp") if "GrallocModule::getInstance" in p.read_text(errors="ignore")]
+          print("Found GrallocModule::getInstance in:", gralloc_cpps)
+          cm = (root / "CMakeLists.txt").read_text()
+          for gcpp in gralloc_cpps:
+              if gcpp not in cm:
+                  cm = cm.replace("${OPENGL_DIR}/common/debug.cpp", "${OPENGL_DIR}/common/debug.cpp\n    ${CMAKE_CURRENT_SOURCE_DIR}/" + gcpp, 1)
+                  print("Injected into CMakeLists.txt:", gcpp)
+          (root / "CMakeLists.txt").write_text(cm)
           PYEOF
 
           AOSP_INC_DIRS=$(find "${PWD}/aosp-core" "${PWD}/aosp-logging" "${PWD}/aosp-hw" "${PWD}/aosp-native" -maxdepth 4 -type d -name 'include*' | tr '\n' ' ')
@@ -160,8 +169,8 @@ jobs:
             echo "ERROR: libEGL_swiftshader.so still missing EGL_NATIVE_BUFFER_ANDROID path!"
             exit 1
           fi
-          if "${READELF}" -Ws swiftshader-out/*.so | grep -qE "UND.*AndroidEnterDebugger"; then
-            echo "ERROR: SwiftShader still has undefined AndroidEnterDebugger!"
+          if "${READELF}" -Ws swiftshader-out/*.so | grep -E "UND.*_Z" | grep -vE "(__cxa_|_ZN7android|_ZNK7android|_ZNSt3__1)" ; then
+            echo "ERROR: SwiftShader has unexpected undefined C++ symbols!"
             exit 1
           fi
 
