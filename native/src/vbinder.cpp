@@ -183,11 +183,15 @@ bool VBinderBroker::ensure_mmap_base(ClientState& client) {
 }
 
 uint64_t VBinderBroker::alloc_rx_space(ClientState& client, size_t len, size_t& out_offset) {
+    // libbinder maps BINDER_VM_SIZE = 1 MiB - 2 pages (0xFE000); libhwbinder defaults to 128 KiB (0x20000).
+    // Keep ring allocations strictly inside each domain's guest mmap window to prevent SEGV_ACCERR.
+    const size_t ring_limit =
+        (client.domain == BinderDomain::kHwBinder) ? (112u * 1024u) : (960u * 1024u);
     size_t aligned = align8(std::max<size_t>(len, 8));
-    if (client.rx_cursor + aligned > kRxRingSize) {
+    if (client.rx_cursor + aligned > ring_limit) {
         client.rx_cursor = 0;
     }
-    if (aligned > kRxRingSize) return 0;
+    if (aligned > ring_limit) return 0;
     out_offset = client.rx_cursor;
     client.rx_cursor += aligned;
     return client.guest_mmap_base + out_offset;

@@ -645,7 +645,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7q-vcapget\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7r-capbset-rxlimit\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -1064,7 +1064,7 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         int opt = static_cast<int>(regs.arg(0));
         // Spoof capability bounding-set / ambient / keepcaps / seccomp prctls inside Zygote SpecializeCommon()
         if (opt == 23 /*PR_CAPBSET_READ*/) {
-            skip_with_ret((regs.arg(1) <= 40) ? 1 : 0);
+            skip_with_ret((regs.arg(1) <= 40) ? 1 : -EINVAL);
             return;
         }
         if (opt == 24 /*PR_CAPBSET_DROP*/ || opt == 8 /*PR_SET_KEEPCAPS*/ ||
