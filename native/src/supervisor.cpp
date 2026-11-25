@@ -645,7 +645,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7p-apex-sscp\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7q-vcapget\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -1063,6 +1063,10 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
     if (nr == SYS_prctl) {
         int opt = static_cast<int>(regs.arg(0));
         // Spoof capability bounding-set / ambient / keepcaps / seccomp prctls inside Zygote SpecializeCommon()
+        if (opt == 23 /*PR_CAPBSET_READ*/) {
+            skip_with_ret((regs.arg(1) <= 40) ? 1 : 0);
+            return;
+        }
         if (opt == 24 /*PR_CAPBSET_DROP*/ || opt == 8 /*PR_SET_KEEPCAPS*/ ||
             opt == 47 /*PR_CAP_AMBIENT*/ || opt == 22 /*PR_SET_SECCOMP*/) {
             skip_with_ret(0);
@@ -1158,7 +1162,62 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         skip_with_ret(-ENODATA);
         return;
     }
-    if (nr == SYS_setgroups || nr == SYS_capset ||
+    if (nr == SYS_capget || nr == SYS_capset) {
+        struct CapHeader { uint32_t version; int32_t pid; };
+        struct CapData { uint32_t effective; uint32_t permitted; uint32_t inheritable; };
+        constexpr uint32_t kCapVer1 = 0x19980330U;
+        constexpr uint32_t kCapVer2 = 0x20071026U;
+        constexpr uint32_t kCapVer3 = 0x20080522U;
+
+        uint64_t hdr_ptr = regs.arg(0);
+        uint64_t data_ptr = regs.arg(1);
+        CapHeader hdr {};
+        if (hdr_ptr == 0 || !read_guest_mem(pid, hdr_ptr, &hdr, sizeof(hdr))) {
+            skip_with_ret(-EFAULT);
+            return;
+        }
+        bool known_ver = (hdr.version == kCapVer1 || hdr.version == kCapVer2 || hdr.version == kCapVer3);
+        if (!known_ver) {
+            hdr.version = kCapVer3;
+            write_guest_mem(pid, hdr_ptr, &hdr, sizeof(hdr));
+            skip_with_ret(data_ptr == 0 ? 0 : -EINVAL);
+            return;
+        }
+        size_t n_words = (hdr.version == kCapVer1) ? 1 : 2;
+        if (nr == SYS_capget) {
+            if (data_ptr != 0) {
+                const VirtualCreds& c = proc.creds;
+                CapData d[2] {};
+                d[0].effective = static_cast<uint32_t>(c.cap_effective & 0xFFFFFFFFULL);
+                d[0].permitted = static_cast<uint32_t>(c.cap_permitted & 0xFFFFFFFFULL);
+                d[0].inheritable = static_cast<uint32_t>(c.cap_inheritable & 0xFFFFFFFFULL);
+                d[1].effective = static_cast<uint32_t>(c.cap_effective >> 32);
+                d[1].permitted = static_cast<uint32_t>(c.cap_permitted >> 32);
+                d[1].inheritable = static_cast<uint32_t>(c.cap_inheritable >> 32);
+                write_guest_mem(pid, data_ptr, d, sizeof(CapData) * n_words);
+            }
+            skip_with_ret(0);
+            return;
+        } else {
+            if (data_ptr != 0) {
+                CapData d[2] {};
+                if (read_guest_mem(pid, data_ptr, d, sizeof(CapData) * n_words)) {
+                    if (n_words == 1) {
+                        proc.creds.cap_effective = d[0].effective;
+                        proc.creds.cap_permitted = d[0].permitted;
+                        proc.creds.cap_inheritable = d[0].inheritable;
+                    } else {
+                        proc.creds.cap_effective = (static_cast<uint64_t>(d[1].effective) << 32) | d[0].effective;
+                        proc.creds.cap_permitted = (static_cast<uint64_t>(d[1].permitted) << 32) | d[0].permitted;
+                        proc.creds.cap_inheritable = (static_cast<uint64_t>(d[1].inheritable) << 32) | d[0].inheritable;
+                    }
+                }
+            }
+            skip_with_ret(0);
+            return;
+        }
+    }
+    if (nr == SYS_setgroups ||
         nr == SYS_mount || nr == SYS_umount2 || nr == SYS_chroot || nr == SYS_pivot_root ||
         nr == SYS_sethostname || nr == SYS_setdomainname || nr == SYS_unshare) {
         skip_with_ret(0);
