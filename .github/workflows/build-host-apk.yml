@@ -62,7 +62,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: swiftshader-out
-          key: swiftshader-gles-arm64-v8a-llvm-r4
+          key: swiftshader-gles-arm64-v8a-llvm-r5
 
       - name: Build SwiftShader OpenGL ES (arm64-v8a)
         if: steps.cache-swiftshader.outputs.cache-hit != 'true'
@@ -128,6 +128,20 @@ jobs:
                   extra += '#include "../../Common/GrallocAndroid.cpp"\n'
               dbg_cpp.write_text(dbg_cpp.read_text() + extra)
               print("Updated debug.cpp with AndroidEnterDebugger stub + GrallocAndroid.cpp")
+          # Support HAL_PIXEL_FORMAT_RGBA_FP16 (22) & RGBA_1010102 (43) for SurfaceFlinger primeShaderCache()
+          img_hpp = root / "src/OpenGL/common/Image.hpp"
+          if img_hpp.exists():
+              ih = img_hpp.read_text()
+              anchor = "case HAL_PIXEL_FORMAT_RGBA_8888:"
+              if anchor in ih and "HAL_PIXEL_FORMAT_RGBA_FP16" not in ih:
+                  ih = ih.replace(
+                      anchor,
+                      "case 22 /* HAL_PIXEL_FORMAT_RGBA_FP16 */: return GL_RGBA16F;\n\t\t"
+                      "case 43 /* HAL_PIXEL_FORMAT_RGBA_1010102 */: return GL_RGB10_A2;\n\t\t" + anchor,
+                      1,
+                  )
+                  img_hpp.write_text(ih)
+                  print("Patched Image.hpp with RGBA_FP16 (22) and RGBA_1010102 (43)")
           PYEOF
 
           AOSP_INC_DIRS=$(find "${PWD}/aosp-core" "${PWD}/aosp-logging" "${PWD}/aosp-hw" "${PWD}/aosp-native" -maxdepth 4 -type d -name 'include*' | tr '\n' ' ')
