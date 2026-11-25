@@ -405,7 +405,7 @@ class MainActivity : AppCompatActivity() {
         for (name in listOf("libEGL_swiftshader.so", "libGLESv1_CM_swiftshader.so", "libGLESv2_swiftshader.so")) {
             val src = File(applicationInfo.nativeLibraryDir, name)
             val dst = File(eglDir, name)
-            if (src.exists() && (!dst.exists() || dst.length() != src.length())) {
+            if (src.exists()) {
                 src.copyTo(dst, overwrite = true)
                 runCatching { Os.chmod(dst.absolutePath, 0x1ED) }
             }
@@ -414,7 +414,7 @@ class MainActivity : AppCompatActivity() {
         hwDir.mkdirs()
         fun copyIfChanged(srcName: String, dstFile: File) {
             val src = File(applicationInfo.nativeLibraryDir, srcName)
-            if (src.exists() && (!dstFile.exists() || dstFile.length() != src.length())) {
+            if (src.exists()) {
                 dstFile.parentFile?.mkdirs()
                 src.copyTo(dstFile, overwrite = true)
                 runCatching { Os.chmod(dstFile.absolutePath, 0x1ED) }

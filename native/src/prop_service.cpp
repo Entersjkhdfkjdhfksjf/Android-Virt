@@ -375,6 +375,8 @@ void PropertyService::seed_default_aosp12_properties() {
         {"ro.hardware.gralloc", "virt"},
         {"ro.hardware.hwcomposer", "virt"},
         {"ro.hardware.egl", "swiftshader"},
+        {"debug.renderengine.backend", "gles"},
+        {"ro.surface_flinger.use_color_management", "false"},
         {"ro.opengles.version", "196608"},
         {"ro.sf.lcd_density", "280"},
         {"ro.zygote.disable_gl_preload", "true"},

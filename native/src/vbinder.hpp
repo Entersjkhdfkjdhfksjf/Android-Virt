@@ -144,6 +144,7 @@ private:
         uint32_t max_threads = 15;
         int active_loopers = 0;
         bool spawn_looper_sent = false;
+        bool owns_binder_node = false;
         uint32_t next_handle = 1;
 
         std::unordered_map<uint32_t, uint64_t> handle_to_node;

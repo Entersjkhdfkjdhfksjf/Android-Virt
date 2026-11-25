@@ -261,22 +261,30 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
     auto wit = client.waiting_reply_depth.find(target_tid);
     bool is_waiting_reply = (wit != client.waiting_reply_depth.end() && wit->second > 0);
 
-    // If process-wide transactions (e.g. oneway IServiceNotification::onRegistration)
-    // are queued while this thread is only waiting for a reply (or draining thread_inboxes)
-    // and no binder looper thread exists, emit BR_SPAWN_LOOPER FIRST so
-    // IPCThreadState::waitForResponse() spawns a looper before returning on BR_REPLY.
+    // If this process owns a binder node (e.g. HIDL Waiter) or has queued process-wide
+    // transactions (e.g. oneway IServiceNotification::onRegistration) with no looper thread,
+    // emit BR_SPAWN_LOOPER before BR_REPLY (or after BR_TRANSACTION_COMPLETE while waiting)
+    // so IPCThreadState::waitForResponse() spawns a looper thread before returning.
+    auto maybe_emit_spawn_looper = [&]() {
+        if ((!client.inbox.empty() || client.owns_binder_node) && client.active_loopers == 0 &&
+            !client.spawn_looper_sent && client.max_threads > 0 &&
+            out.size() + sizeof(uint32_t) <= bwr.read_size) {
+            uint32_t spawn_cmd = binder::kBrSpawnLooper;
+            const auto* sp_bytes = reinterpret_cast<const uint8_t*>(&spawn_cmd);
+            out.insert(out.end(), sp_bytes, sp_bytes + sizeof(spawn_cmd));
+            client.spawn_looper_sent = true;
+        }
+    };
     auto& tq = client.thread_inboxes[target_tid];
-    if (!client.inbox.empty() && client.active_loopers == 0 &&
-        !client.spawn_looper_sent && client.max_threads > 0 &&
-        (is_waiting_reply || !tq.empty()) &&
-        out.size() + sizeof(uint32_t) <= bwr.read_size) {
-        uint32_t spawn_cmd = binder::kBrSpawnLooper;
-        const auto* sp_bytes = reinterpret_cast<const uint8_t*>(&spawn_cmd);
-        out.insert(out.end(), sp_bytes, sp_bytes + sizeof(spawn_cmd));
-        client.spawn_looper_sent = true;
-    }
     while (!tq.empty()) {
         const auto& ev = tq.front();
+        uint32_t ev_cmd = 0;
+        if (ev.bytes.size() >= sizeof(uint32_t)) {
+            std::memcpy(&ev_cmd, ev.bytes.data(), sizeof(uint32_t));
+        }
+        if (ev_cmd == binder::kBrReply) {
+            maybe_emit_spawn_looper();
+        }
         if (out.size() + ev.bytes.size() > bwr.read_size) break;
         apply_fd_patches(ev);
         if (ev.reply_to.tgid != 0) {
@@ -284,6 +292,9 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
         }
         out.insert(out.end(), ev.bytes.begin(), ev.bytes.end());
         tq.pop_front();
+    }
+    if (is_waiting_reply) {
+        maybe_emit_spawn_looper();
     }
 
     // Only pull process-wide transactions/refcounts if this thread isn't actively blocked
@@ -515,6 +526,7 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
         auto* obj = reinterpret_cast<binder::flat_binder_object*>(payload.data() + obj_off);
         if (obj->hdr.type == binder::kBinderTypeBinder ||
             obj->hdr.type == binder::kBinderTypeWeakBinder) {
+            sender.owns_binder_node = true;
             uint64_t node_id = get_or_create_node(dom, sender.pid, obj->binder, obj->cookie);
             auto nit = dom.nodes.find(node_id);
             if (nit != dom.nodes.end() && !nit->second.driver_refs_sent) {
