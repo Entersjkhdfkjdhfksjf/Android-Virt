@@ -361,6 +361,7 @@ void PropertyService::load_build_prop_file(const std::string& path) {
 
 void PropertyService::seed_default_aosp12_properties() {
     load_build_prop_file(rootfs_root_ + "/system/build.prop");
+    load_build_prop_file(rootfs_root_ + "/vendor/build.prop");
 
     const std::pair<const char*, const char*> defaults[] = {
         {"ro.property_service.version", "2"},
@@ -402,12 +403,13 @@ void PropertyService::seed_default_aosp12_properties() {
         {"ro.debuggable", "1"},
         {"ro.secure", "0"},
         {"debug.sf.nobootanimation", "1"},
-        {"ro.surface_flinger.use_color_management", "false"},
+        {"ro.setupwizard.mode", "DISABLED"},
         {"sys.boot_completed", "0"},
     };
     for (const auto& [k, v] : defaults) {
         set(k, v);
     }
+    load_build_prop_file(rootfs_root_ + "/vguest_props.txt");
 }
 
 bool PropertyService::start() {

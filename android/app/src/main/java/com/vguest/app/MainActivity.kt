@@ -431,12 +431,28 @@ class MainActivity : AppCompatActivity() {
         copyIfChanged("libvguest_suspend_svc.so", File(vendorHwBin, "android.system.suspend@1.0-service"))
     }
 
+    private fun syncHotReloadProps() {
+        val candidates = listOfNotNull(
+            getExternalFilesDir(null)?.let { File(it, "vguest_props.txt") },
+            File("/sdcard/Download/vguest_props.txt")
+        )
+        val dst = File(rootfsDir, "vguest_props.txt")
+        val src = candidates.firstOrNull { it.exists() && it.canRead() }
+        if (src != null) {
+            src.copyTo(dst, overwrite = true)
+            appendLog("[props] Loaded hot-reload overrides from ${src.absolutePath}")
+        } else if (dst.exists()) {
+            dst.delete()
+        }
+    }
+
     private fun runBootStage(stage: String) {
         if (!runnerBin.exists() || !File(rootfsDir, "system/bin/sh").exists()) {
             appendLog("[ERROR] Rootfs or runner missing.")
             return
         }
         syncVendorEglLibs()
+        syncHotReloadProps()
         if (stage == "full") {
             DisplayBridge.nativeInitDisplay(rootfsDir.absolutePath, FB_WIDTH, FB_HEIGHT)
         }

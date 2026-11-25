@@ -618,6 +618,7 @@ void VBinderBroker::dispatch_transaction(DomainState& dom, ClientState& sender,
         ReplyTarget rt {};
         if ((tr.flags & binder::kTfOneWay) == 0) {
             sender.waiting_reply_depth[sender_tid]++;
+            sender.last_tx_by_tid[sender_tid] = ClientState::LastTxInfo{target.pid, tr.code, tr.flags};
             rt = ReplyTarget{sender.pid, sender_tid};
             // Re-entrant nested sync transaction (e.g. registerCallback -> onHotplug):
             // route directly to the caller thread waiting on our reply to prevent deadlock.
@@ -891,6 +892,64 @@ std::vector<WakeEvent> VBinderBroker::on_process_exit(pid_t pid) {
         }
     }
     return wakes;
+}
+
+
+static std::string read_proc_short(const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "r");
+    if (!f) return "?";
+    char buf[64] = {};
+    size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
+    std::fclose(f);
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == '\0')) --n;
+    buf[n] = '\0';
+    return n > 0 ? std::string(buf) : "?";
+}
+
+void VBinderBroker::dump_state(FILE* out) const {
+    if (!out) return;
+    static const char* kDomNames[3] = {"binder", "hwbinder", "vndbinder"};
+    bool any = false;
+    for (int d = 0; d < 3; ++d) {
+        for (const auto& kv : domains_[d].clients) {
+            const ClientState& c = kv.second;
+            bool has_wait = false;
+            for (const auto& wv : c.waiting_reply_depth) {
+                if (wv.second > 0) { has_wait = true; break; }
+            }
+            if (!has_wait && c.inbox.empty()) continue;
+            if (!any) {
+                std::fprintf(out, "[vbinder/diag] === Active waiters & non-empty inboxes ===\n");
+                any = true;
+            }
+            std::string pcomm = read_proc_short("/proc/" + std::to_string(c.pid) + "/comm");
+            std::fprintf(out, "[vbinder/diag] dom=%s pid=%d(%s) loopers=%d inbox=%zu owns_node=%d\n",
+                         kDomNames[d], static_cast<int>(c.pid), pcomm.c_str(),
+                         c.active_loopers, c.inbox.size(), c.owns_binder_node ? 1 : 0);
+            for (const auto& wv : c.waiting_reply_depth) {
+                if (wv.second <= 0) continue;
+                pid_t tid = wv.first;
+                std::string tcomm = read_proc_short("/proc/" + std::to_string(c.pid) + "/task/" +
+                                                    std::to_string(tid) + "/comm");
+                std::string wchan = read_proc_short("/proc/" + std::to_string(c.pid) + "/task/" +
+                                                    std::to_string(tid) + "/wchan");
+                bool is_parked = (parked_.find(tid) != parked_.end());
+                auto txit = c.last_tx_by_tid.find(tid);
+                if (txit != c.last_tx_by_tid.end()) {
+                    std::string dst_comm = read_proc_short("/proc/" + std::to_string(txit->second.target_tgid) + "/comm");
+                    std::fprintf(out, "  wait tid=%d(%s) depth=%d parked=%d wchan=%s -> target=%d(%s) code=%u\n",
+                                 static_cast<int>(tid), tcomm.c_str(), wv.second, is_parked ? 1 : 0,
+                                 wchan.c_str(), static_cast<int>(txit->second.target_tgid),
+                                 dst_comm.c_str(), txit->second.code);
+                } else {
+                    std::fprintf(out, "  wait tid=%d(%s) depth=%d parked=%d wchan=%s\n",
+                                 static_cast<int>(tid), tcomm.c_str(), wv.second, is_parked ? 1 : 0,
+                                 wchan.c_str());
+                }
+            }
+        }
+    }
+    if (any) std::fflush(out);
 }
 
 }  // namespace vguest

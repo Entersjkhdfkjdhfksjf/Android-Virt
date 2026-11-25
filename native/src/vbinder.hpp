@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <functional>
 #include <string>
@@ -80,6 +81,7 @@ public:
     }
 
     std::vector<WakeEvent> on_process_exit(pid_t pid);
+    void dump_state(FILE* out) const;
 
     static bool domain_from_guest_path(std::string_view guest_path, BinderDomain& out_domain);
 
@@ -152,7 +154,13 @@ private:
         std::deque<PendingBrEvent> inbox;
         std::unordered_map<pid_t, std::deque<PendingBrEvent>> thread_inboxes;
         std::unordered_map<pid_t, std::deque<ReplyTarget>> thread_reply_stacks;
+        struct LastTxInfo {
+            pid_t target_tgid = 0;
+            uint32_t code = 0;
+            uint32_t flags = 0;
+        };
         std::unordered_map<pid_t, int> waiting_reply_depth;
+        std::unordered_map<pid_t, LastTxInfo> last_tx_by_tid;
     };
 
     struct DomainState {

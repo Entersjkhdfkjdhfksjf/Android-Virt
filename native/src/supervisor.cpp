@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <elf.h>
 #include <fcntl.h>
@@ -366,7 +367,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7f-gles-sync-looper\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7g-redroid-diag\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -524,8 +525,16 @@ int Supervisor::run_ptrace_loop(pid_t root_child) {
     ::ptrace(PTRACE_CONT, root_child, nullptr, nullptr);
 
     int root_exit_code = 0;
+    auto last_diag_dump = std::chrono::steady_clock::now();
 
     while (!registry_.empty()) {
+        if (cfg_.verbose) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_diag_dump).count() >= 15) {
+                last_diag_dump = now;
+                vbinder_.dump_state(stderr);
+            }
+        }
         pid_t pid = ::waitpid(-1, &status, __WALL);
         if (pid < 0) {
             if (errno == EINTR) continue;

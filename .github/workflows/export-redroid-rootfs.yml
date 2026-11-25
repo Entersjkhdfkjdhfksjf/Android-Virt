@@ -1,0 +1,54 @@
+name: Export Redroid ARM64 Rootfs
+
+on:
+  workflow_dispatch:
+    inputs:
+      redroid_tag:
+        description: "Docker Hub tag for redroid/redroid (arm64)"
+        required: true
+        default: "12.0.0_64only-latest"
+      artifact_name:
+        description: "Output artifact name"
+        required: true
+        default: "redroid12-arm64-rootfs"
+
+jobs:
+  export-rootfs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Install tools (zstd, e2fsprogs)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd e2fsprogs python3
+
+      - name: Pull Redroid linux/arm64 image & export filesystem
+        run: |
+          mkdir -p work/rootfs
+          IMAGE="redroid/redroid:${{ inputs.redroid_tag }}"
+          echo "Pulling $IMAGE (linux/arm64)..."
+          docker pull --platform linux/arm64 "$IMAGE"
+          CID=$(docker create --platform linux/arm64 "$IMAGE")
+          echo "Exporting container $CID..."
+          docker export "$CID" | sudo tar -C work/rootfs -xf -
+          docker rm "$CID"
+          sudo chown -R "$(id -u):$(id -g)" work/rootfs
+
+      - name: Prepare rootfs (flatten APEXes + build VfsMetaDb)
+        run: |
+          python3 tools/ci_export_redroid_rootfs.py work/rootfs work/rootfs_meta.db
+
+      - name: Pack VGuest .tar.zst archive
+        run: |
+          OUT="${{ inputs.artifact_name }}.tar.zst"
+          tar -C work -cf - rootfs rootfs_meta.db | zstd -T0 -9 -o "$OUT"
+          ls -lh "$OUT"
+
+      - name: Upload Redroid rootfs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: ${{ inputs.artifact_name }}.tar.zst
+          retention-days: 7
