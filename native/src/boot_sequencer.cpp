@@ -71,7 +71,8 @@ std::string build_fallback_bootclasspath(const std::string& rootfs) {
             if (!jd) continue;
             while (struct dirent* jent = ::readdir(jd)) {
                 std::string jf = jent->d_name;
-                if (jf.size() > 4 && jf.substr(jf.size() - 4) == ".jar") {
+                if (jf.size() > 4 && jf.substr(jf.size() - 4) == ".jar" &&
+                    jf.rfind("service-", 0) != 0) {
                     std::string gpath = "/apex/" + mod + "/javalib/" + jf;
                     if (std::find(jars.begin(), jars.end(), gpath) == jars.end()) {
                         extra.push_back(gpath);
@@ -93,6 +94,50 @@ std::string build_fallback_bootclasspath(const std::string& rootfs) {
     return joined;
 }
 
+std::string append_apex_systemserver_jars(const std::string& rootfs, const std::string& base_sscp) {
+    std::vector<std::string> jars;
+    {
+        std::istringstream iss(base_sscp);
+        std::string item;
+        while (std::getline(iss, item, ':')) {
+            if (!item.empty() && std::find(jars.begin(), jars.end(), item) == jars.end()) {
+                jars.push_back(item);
+            }
+        }
+    }
+    std::string apex_dir = rootfs + "/apex";
+    if (DIR* ad = ::opendir(apex_dir.c_str())) {
+        std::vector<std::string> extra;
+        while (struct dirent* ent = ::readdir(ad)) {
+            std::string mod = ent->d_name;
+            if (mod == "." || mod == ".." || mod.find('@') != std::string::npos) continue;
+            std::string jdir = apex_dir + "/" + mod + "/javalib";
+            DIR* jd = ::opendir(jdir.c_str());
+            if (!jd) continue;
+            while (struct dirent* jent = ::readdir(jd)) {
+                std::string jf = jent->d_name;
+                if (jf.size() > 4 && jf.substr(jf.size() - 4) == ".jar" &&
+                    jf.rfind("service-", 0) == 0) {
+                    std::string gpath = "/apex/" + mod + "/javalib/" + jf;
+                    if (std::find(jars.begin(), jars.end(), gpath) == jars.end()) {
+                        extra.push_back(gpath);
+                    }
+                }
+            }
+            ::closedir(jd);
+        }
+        ::closedir(ad);
+        std::sort(extra.begin(), extra.end());
+        for (auto& e : extra) jars.push_back(std::move(e));
+    }
+    std::string joined;
+    for (size_t i = 0; i < jars.size(); ++i) {
+        if (i > 0) joined.push_back(':');
+        joined.append(jars[i]);
+    }
+    return joined;
+}
+
 std::string build_fallback_systemserverclasspath(const std::string& rootfs) {
     const char* ordered[] = {
         "/system/framework/com.android.location.provider.jar",
@@ -106,7 +151,7 @@ std::string build_fallback_systemserverclasspath(const std::string& rootfs) {
             joined.append(g);
         }
     }
-    return joined;
+    return append_apex_systemserver_jars(rootfs, joined);
 }
 
 }  // namespace
@@ -154,7 +199,10 @@ std::vector<std::string> BootSequencer::load_init_environ() const {
             val = trim(val);
             if (!key.empty() && !val.empty()) {
                 if (key == "BOOTCLASSPATH") has_bcp = true;
-                if (key == "SYSTEMSERVERCLASSPATH") has_sscp = true;
+                if (key == "SYSTEMSERVERCLASSPATH") {
+                    has_sscp = true;
+                    val = append_apex_systemserver_jars(rootfs_root_, val);
+                }
                 env.push_back(key + "=" + val);
             }
         }
