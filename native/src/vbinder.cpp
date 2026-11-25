@@ -267,7 +267,7 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
     // so IPCThreadState::waitForResponse() spawns a looper thread before returning.
     auto maybe_emit_spawn_looper = [&]() {
         if ((!client.inbox.empty() || client.owns_binder_node) && client.active_loopers == 0 &&
-            !client.spawn_looper_sent && client.max_threads > 0 &&
+            !client.spawn_looper_sent &&
             out.size() + sizeof(uint32_t) <= bwr.read_size) {
             uint32_t spawn_cmd = binder::kBrSpawnLooper;
             const auto* sp_bytes = reinterpret_cast<const uint8_t*>(&spawn_cmd);
@@ -275,6 +275,7 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
             client.spawn_looper_sent = true;
         }
     };
+    bool sent_reply = false;
     auto& tq = client.thread_inboxes[target_tid];
     while (!tq.empty()) {
         const auto& ev = tq.front();
@@ -284,6 +285,7 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
         }
         if (ev_cmd == binder::kBrReply) {
             maybe_emit_spawn_looper();
+            sent_reply = true;
         }
         if (out.size() + ev.bytes.size() > bwr.read_size) break;
         apply_fd_patches(ev);
@@ -292,15 +294,16 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
         }
         out.insert(out.end(), ev.bytes.begin(), ev.bytes.end());
         tq.pop_front();
+        if (sent_reply) break;
     }
     if (is_waiting_reply) {
         maybe_emit_spawn_looper();
     }
 
     // Only pull process-wide transactions/refcounts if this thread isn't actively blocked
-    // waiting for a synchronous BR_REPLY. Deliver at most ONE BR_TRANSACTION per ioctl
-    // (matching Linux binder.c) so thread_reply_stacks never mixes up concurrent callers.
-    if (!is_waiting_reply) {
+    // waiting for (or just returning from) a synchronous BR_REPLY. Deliver at most ONE
+    // BR_TRANSACTION per ioctl (matching Linux binder.c) so thread_reply_stacks stays exact.
+    if (!is_waiting_reply && !sent_reply) {
         while (!client.inbox.empty()) {
             const auto& ev = client.inbox.front();
             if (out.size() + ev.bytes.size() > bwr.read_size) break;
