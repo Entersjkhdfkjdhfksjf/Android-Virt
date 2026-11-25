@@ -419,18 +419,23 @@ int Supervisor::scm_send_fd(pid_t target_tid, int held_fd) const {
 
 int Supervisor::grab_fd_from_sender(pid_t sender_tgid, pid_t sender_tid, int sender_fd) const {
     if (sender_tgid <= 0 || sender_fd < 0) return -1;
+    // Always prefer SCM_RIGHTS so the exact kernel struct file* is duplicated
+    // (critical for /dev/ashmem FMQ buffers, AF_UNIX BitTube/InputChannel sockets, and memfds).
+    int fd = scm_grab_fd(sender_tid, sender_fd);
+    if (fd >= 0) return fd;
     std::string proc_path = "/proc/" + std::to_string(static_cast<int>(sender_tgid)) +
                             "/fd/" + std::to_string(sender_fd);
-    int fd = ::open(proc_path.c_str(), O_RDWR | O_CLOEXEC);
+    fd = ::open(proc_path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0 && (errno == EACCES || errno == EROFS)) {
         fd = ::open(proc_path.c_str(), O_RDONLY | O_CLOEXEC);
     }
-    if (fd >= 0) return fd;
-    return scm_grab_fd(sender_tid, sender_fd);
+    return fd;
 }
 
 int Supervisor::dup_held_fd_into_target(int held_fd, pid_t target_tid) const {
     if (held_fd < 0 || target_tid <= 0) return -1;
+    int new_fd = scm_send_fd(target_tid, held_fd);
+    if (new_fd >= 0) return new_fd;
     ArchRegs saved;
     if (!saved.load(target_tid)) return -1;
 
@@ -447,7 +452,7 @@ int Supervisor::dup_held_fd_into_target(int held_fd, pid_t target_tid) const {
         }
         if (nfd >= 0) return static_cast<int>(nfd);
     }
-    return scm_send_fd(target_tid, held_fd);
+    return -1;
 }
 
 int Supervisor::dup_fd_into_target(pid_t sender_tgid, int sender_fd, pid_t target_tid) const {
@@ -639,7 +644,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7m-egl-health\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7n-scm-ashmem\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
