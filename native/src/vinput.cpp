@@ -67,6 +67,12 @@ bool VInputHub::start() {
     ::mkdir((rootfs_root_ + "/tmp").c_str(), 0755);
     ::mkdir((rootfs_root_ + "/dev").c_str(), 0755);
     ::mkdir((rootfs_root_ + "/dev/socket").c_str(), 0755);
+    ::mkdir((rootfs_root_ + "/dev/input").c_str(), 0755);
+    for (int i = 0; i < 2; ++i) {
+        std::string ev_node = rootfs_root_ + "/dev/input/event" + std::to_string(i);
+        int efd = ::open(ev_node.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0666);
+        if (efd >= 0) ::close(efd);
+    }
 
     // Create named FIFOs for /dev/input/event0 and event1; open O_RDWR|O_NONBLOCK so writers never block
     for (int i = 0; i < 2; ++i) {
@@ -200,12 +206,33 @@ int64_t VInputHub::handle_ioctl(pid_t pid, int fd, unsigned long cmd, uint64_t a
         return mem_ops_.write(pid, arg_ptr, name, len) ? static_cast<int64_t>(len) : -EFAULT;
     }
 
+    // EVIOCGPHYS (0x07)
+    if (nr == 0x07) {
+        const char* phys = (dev == VInputDevice::kStylus) ? "vguest/input1" : "vguest/input0";
+        size_t len = std::min<size_t>(std::strlen(phys) + 1, size);
+        return mem_ops_.write(pid, arg_ptr, phys, len) ? static_cast<int64_t>(len) : -EFAULT;
+    }
+
+    // EVIOCGUNIQ (0x08)
+    if (nr == 0x08) {
+        const char* uniq = (dev == VInputDevice::kStylus) ? "vguest-spen-1" : "vguest-touch-0";
+        size_t len = std::min<size_t>(std::strlen(uniq) + 1, size);
+        return mem_ops_.write(pid, arg_ptr, uniq, len) ? static_cast<int64_t>(len) : -EFAULT;
+    }
+
     // EVIOCGPROP (0x09)
     if (nr == 0x09) {
         std::vector<uint8_t> bits(size, 0);
         set_bit(bits, INPUT_PROP_DIRECT);
         return mem_ops_.write(pid, arg_ptr, bits.data(), bits.size())
                    ? static_cast<int64_t>(bits.size()) : -EFAULT;
+    }
+
+    // EVIOCGKEY (0x18), EVIOCGLED (0x19), EVIOCGSW (0x1b): zeroed state bitmasks
+    if (nr == 0x18 || nr == 0x19 || nr == 0x1b) {
+        std::vector<uint8_t> zeros(size, 0);
+        return mem_ops_.write(pid, arg_ptr, zeros.data(), zeros.size())
+                   ? static_cast<int64_t>(zeros.size()) : -EFAULT;
     }
 
     // EVIOCGBIT(ev, len): nr = 0x20 + ev

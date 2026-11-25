@@ -645,7 +645,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7r-capbset-rxlimit\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7s-inotify-vinput\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -1459,6 +1459,12 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         rewrite_path_arg(-1, 0, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
         return;
     }
+#ifdef SYS_inotify_add_watch
+    if (nr == SYS_inotify_add_watch) {
+        rewrite_path_arg(-1, 1, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
+        return;
+    }
+#endif
     if (nr == SYS_execve) {
         std::string raw_path;
         if (!read_guest_cstring(pid, regs.arg(0), raw_path)) return;
@@ -1565,7 +1571,7 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
     if (regs.ret() < 0) return;
 
     if (op.kind == ExitPatchKind::kRegisterInputFd) {
-        vinput_.register_client_fd(pid, static_cast<int>(regs.ret()),
+        vinput_.register_client_fd(proc.tgid, static_cast<int>(regs.ret()),
                                    static_cast<VInputDevice>(op.binder_domain));
         return;
     }

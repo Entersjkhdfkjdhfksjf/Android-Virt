@@ -140,6 +140,9 @@ std::vector<uint32_t> intercepted_syscalls() {
 #ifdef SYS_readlink
     nrs.push_back(SYS_readlink);
 #endif
+#ifdef SYS_inotify_add_watch
+    nrs.push_back(SYS_inotify_add_watch);
+#endif
     return nrs;
 }
 
