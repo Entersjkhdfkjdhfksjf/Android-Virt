@@ -383,6 +383,13 @@ cat > "${WORK}/suspend_service_main.cpp" <<'CPPEOF'
 #include <hidl/HidlTransportSupport.h>
 #include <log/log.h>
 #include <utils/String16.h>
+#include <arpa/inet.h>
+#include <cstring>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <pthread.h>
+#include <unistd.h>
 
 using android::BBinder;
 using android::Parcel;
@@ -457,7 +464,57 @@ private:
     int32_t iface_version_;
 };
 
+static void* lmkd_client_thread(void* arg) {
+    int cli = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    uint32_t buf[64];
+    while (true) {
+        ssize_t n = ::recv(cli, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        uint32_t cmd = ntohl(buf[0]);
+        // LMK_GETKILLCNT (4) and LMK_UPDATE_PROPS (7) expect a 2-word reply [cmd, 0]
+        if (cmd == 4 || cmd == 7) {
+            uint32_t rep[2] = { buf[0], 0 };
+            (void)::send(cli, rep, sizeof(rep), MSG_NOSIGNAL);
+        }
+    }
+    ::close(cli);
+    return nullptr;
+}
+
+static void* run_lmkd_stub_server(void*) {
+    const char* sock_path = "/dev/socket/lmkd";
+    ::unlink(sock_path);
+    int srv = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    if (srv < 0) return nullptr;
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    if (::bind(srv, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(srv, 8) != 0) {
+        ::close(srv);
+        return nullptr;
+    }
+    ::chmod(sock_path, 0666);
+    ALOGI("VGuest lmkd stub listening on %s", sock_path);
+    while (true) {
+        int cli = ::accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
+        if (cli < 0) continue;
+        pthread_t ct;
+        if (pthread_create(&ct, nullptr, lmkd_client_thread,
+                           reinterpret_cast<void*>(static_cast<intptr_t>(cli))) == 0) {
+            pthread_detach(ct);
+        } else {
+            ::close(cli);
+        }
+    }
+    return nullptr;
+}
+
 int main() {
+    pthread_t lmkd_tid;
+    if (pthread_create(&lmkd_tid, nullptr, run_lmkd_stub_server, nullptr) == 0) {
+        pthread_detach(lmkd_tid);
+    }
     ProcessState::self()->startThreadPool();
     auto sm = defaultServiceManager();
     if (sm != nullptr) {
@@ -471,7 +528,9 @@ int main() {
                        new VGuestStubBinder("android.os.IStoraged", false));
         sm->addService(String16("netd"),
                        new VGuestStubBinder("android.net.INetd", true, 7));
-        ALOGI("VGuest suspend@1.0: registered suspend_control + suspend_control_internal + vold + storaged + netd");
+        sm->addService(String16("dnsresolver"),
+                       new VGuestStubBinder("android.net.IDnsResolver", true, 9));
+        ALOGI("VGuest suspend@1.0: registered suspend_control + suspend_control_internal + vold + storaged + netd + dnsresolver");
     }
 
     configureRpcThreadpool(2, true /* callerWillJoin */);

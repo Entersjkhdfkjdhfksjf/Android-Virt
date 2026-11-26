@@ -213,7 +213,8 @@ TranslatedPath PathTranslator::translate_absolute(std::string_view guest_abs,
     }
     PathKind initial_kind = classify_guest_path(norm);
     if (initial_kind != PathKind::kNormalRootfs) {
-        return TranslatedPath{initial_kind, norm, norm};
+        std::string host = (initial_kind == PathKind::kVirtualInput) ? (rootfs_root_ + norm) : norm;
+        return TranslatedPath{initial_kind, norm, std::move(host)};
     }
 
     std::string resolved = resolve_symlinks_in_rootfs(norm, follow_final_symlink);
