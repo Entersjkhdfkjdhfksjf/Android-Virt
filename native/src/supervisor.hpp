@@ -77,6 +77,7 @@ private:
     std::string fd_relay_path_;
     int fd_relay_listen_fd_ = -1;
     mutable std::unordered_set<pid_t> injected_stop_tids_;
+    std::unordered_set<uint64_t> uevent_fds_;
 };
 
 }  // namespace vguest

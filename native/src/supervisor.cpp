@@ -10,6 +10,7 @@
 #include <elf.h>
 #include <fcntl.h>
 #include <fstream>
+#include <linux/netlink.h>
 #include <linux/seccomp.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
@@ -645,7 +646,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7x-audio-stubs\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7y-uevent-netlink\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -1224,8 +1225,61 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         return;
     }
 
-    // --- 3. AF_UNIX connect/bind redirection ---
+    // --- 2z. Virtualize NETLINK_KOBJECT_UEVENT sockets (blocked by host SELinux) ---
+    if (nr == SYS_socket) {
+        uint64_t domain = regs.arg(0);
+        uint64_t type = regs.arg(1);
+        uint64_t proto = regs.arg(2);
+        if (domain == AF_NETLINK && proto == NETLINK_KOBJECT_UEVENT) {
+            uint64_t new_type = static_cast<uint64_t>(SOCK_DGRAM) |
+                                (type & static_cast<uint64_t>(SOCK_CLOEXEC | SOCK_NONBLOCK));
+            regs.set_arg(0, AF_UNIX);
+            regs.set_arg(1, new_type);
+            regs.set_arg(2, 0);
+            regs.store(pid);
+            proc.expecting_syscall_exit = true;
+            proc.exit_op = PendingExitOp{ExitPatchKind::kRegisterUeventFd,
+                                         1, type, 2, proto, 0, 0, "", 0, ""};
+        } else if (domain == AF_NETLINK) {
+            proc.expecting_syscall_exit = true;
+            proc.exit_op = PendingExitOp{ExitPatchKind::kUnregisterUeventFd,
+                                         -1, 0, -1, 0, 0, 0, "", 0, ""};
+        }
+        return;
+    }
+
+    // --- 3. AF_UNIX connect/bind redirection (+ virtualized uevent netlink bind) ---
     if (nr == SYS_connect || nr == SYS_bind) {
+        if (nr == SYS_bind) {
+            int sock_fd = static_cast<int>(regs.arg(0));
+            uint64_t ukey = (static_cast<uint64_t>(static_cast<uint32_t>(proc.tgid)) << 32) |
+                            static_cast<uint32_t>(sock_fd);
+            uint64_t nl_ptr = regs.arg(1);
+            uint64_t nl_len = regs.arg(2);
+            if (nl_ptr != 0 && nl_len >= sizeof(struct sockaddr_nl) && uevent_fds_.count(ukey) > 0) {
+                struct sockaddr_nl nl {};
+                if (read_guest_mem(pid, nl_ptr, &nl, sizeof(nl)) && nl.nl_family == AF_NETLINK) {
+                    struct sockaddr_un out_sa {};
+                    out_sa.sun_family = AF_UNIX;
+                    std::string abs_name = "vguest_uevent_" + std::to_string(proc.tgid) + "_" +
+                                           std::to_string(sock_fd);
+                    size_t copy_len = std::min(abs_name.size(), sizeof(out_sa.sun_path) - 2);
+                    out_sa.sun_path[0] = '\0';
+                    std::memcpy(out_sa.sun_path + 1, abs_name.data(), copy_len);
+                    uint64_t new_len = offsetof(struct sockaddr_un, sun_path) + 1 + copy_len;
+                    uint64_t scratch = scratch_addr_below_sp(regs.sp(), sizeof(out_sa));
+                    if (write_guest_mem(pid, scratch, &out_sa, static_cast<size_t>(new_len))) {
+                        regs.set_arg(1, scratch);
+                        regs.set_arg(2, new_len);
+                        regs.store(pid);
+                        proc.expecting_syscall_exit = true;
+                        proc.exit_op = PendingExitOp{ExitPatchKind::kRestoreRegOnly,
+                                                     1, nl_ptr, 2, nl_len, 0, 0, "", 0, ""};
+                    }
+                    return;
+                }
+            }
+        }
         uint64_t addr_ptr = regs.arg(1);
         uint64_t addr_len = regs.arg(2);
         if (addr_ptr != 0 && addr_len > offsetof(struct sockaddr_un, sun_path) &&
@@ -1581,6 +1635,25 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
         vbinder_.register_client_fd(proc.tgid, returned_fd,
                                     static_cast<BinderDomain>(op.binder_domain),
                                     op.binder_backing_path);
+        return;
+    }
+
+    if (op.kind == ExitPatchKind::kRegisterUeventFd) {
+        int returned_fd = static_cast<int>(regs.ret());
+        if (returned_fd >= 0) {
+            uint64_t ukey = (static_cast<uint64_t>(static_cast<uint32_t>(proc.tgid)) << 32) |
+                            static_cast<uint32_t>(returned_fd);
+            uevent_fds_.insert(ukey);
+        }
+        return;
+    }
+    if (op.kind == ExitPatchKind::kUnregisterUeventFd) {
+        int returned_fd = static_cast<int>(regs.ret());
+        if (returned_fd >= 0) {
+            uint64_t ukey = (static_cast<uint64_t>(static_cast<uint32_t>(proc.tgid)) << 32) |
+                            static_cast<uint32_t>(returned_fd);
+            uevent_fds_.erase(ukey);
+        }
         return;
     }
 

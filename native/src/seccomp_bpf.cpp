@@ -100,6 +100,7 @@ std::vector<uint32_t> intercepted_syscalls() {
         SYS_sethostname,
         SYS_setdomainname,
         // Sockets & Binder epoll
+        SYS_socket,
         SYS_bind,
         SYS_connect,
         SYS_getsockname,

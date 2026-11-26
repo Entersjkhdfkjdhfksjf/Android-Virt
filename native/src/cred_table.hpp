@@ -19,6 +19,8 @@ enum class ExitPatchKind {
     kStripRootfsReadlink, // Rewrite readlinkat() output buffer if it leaked host rootfs
     kRegisterBinderFd,    // Register returned FD from openat("/dev/*binder") with VBinderBroker
     kRegisterInputFd,
+    kRegisterUeventFd,
+    kUnregisterUeventFd,
     kStripRootfsSockaddr, // Strip rootfs prefix from getsockname/getpeername AF_UNIX sun_path     // Register returned FD from openat("/dev/input/event*") with VInputHub
 };
 

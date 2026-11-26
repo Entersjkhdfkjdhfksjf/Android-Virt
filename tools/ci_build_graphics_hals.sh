@@ -600,6 +600,8 @@ int main() {
                        new VGuestStubBinder("android.media.IAudioPolicyService", false));
         sm->addService(String16("media.audio_flinger"),
                        new VGuestStubBinder("android.media.IAudioFlinger", false));
+        sm->addService(String16("media.metrics"),
+                       new VGuestStubBinder("android.media.IMediaMetricsService", false));
         ALOGI("VGuest suspend@1.0: registered suspend_control + vold + storaged + netd + dnsresolver + audio stubs");
     }
 
