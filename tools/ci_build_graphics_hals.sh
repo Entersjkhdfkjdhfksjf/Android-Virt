@@ -57,6 +57,8 @@ cd "${WORK}/hidl-gen-build"
 cat > host_compat.h <<'EOF'
 #pragma once
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
 EOF
@@ -510,10 +512,76 @@ static void* run_lmkd_stub_server(void*) {
     return nullptr;
 }
 
+static void* mdns_client_thread(void* arg) {
+    int cli = static_cast<int>(reinterpret_cast<intptr_t>(arg));
+    char buf[1024];
+    size_t used = 0;
+    while (true) {
+        ssize_t n = ::recv(cli, buf + used, sizeof(buf) - 1 - used, 0);
+        if (n <= 0) break;
+        used += static_cast<size_t>(n);
+        size_t start = 0;
+        for (size_t i = 0; i < used; ++i) {
+            if (buf[i] == '\0') {
+                const char* cmd = buf + start;
+                long seq = std::strtol(cmd, nullptr, 10);
+                char rep[64];
+                int rlen = std::snprintf(rep, sizeof(rep), "200 %ld ok", seq);
+                if (rlen > 0) {
+                    (void)::send(cli, rep, static_cast<size_t>(rlen) + 1, MSG_NOSIGNAL);
+                }
+                start = i + 1;
+            }
+        }
+        if (start > 0) {
+            size_t rem = used - start;
+            if (rem > 0) std::memmove(buf, buf + start, rem);
+            used = rem;
+        } else if (used >= sizeof(buf) - 1) {
+            used = 0;
+        }
+    }
+    ::close(cli);
+    return nullptr;
+}
+
+static void* run_mdns_stub_server(void*) {
+    const char* sock_path = "/dev/socket/mdns";
+    ::unlink(sock_path);
+    int srv = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (srv < 0) return nullptr;
+    struct sockaddr_un addr {};
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+    if (::bind(srv, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(srv, 8) != 0) {
+        ::close(srv);
+        return nullptr;
+    }
+    ::chmod(sock_path, 0666);
+    ALOGI("VGuest mdns stub listening on %s", sock_path);
+    while (true) {
+        int cli = ::accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
+        if (cli < 0) continue;
+        pthread_t ct;
+        if (pthread_create(&ct, nullptr, mdns_client_thread,
+                           reinterpret_cast<void*>(static_cast<intptr_t>(cli))) == 0) {
+            pthread_detach(ct);
+        } else {
+            ::close(cli);
+        }
+    }
+    return nullptr;
+}
+
 int main() {
     pthread_t lmkd_tid;
     if (pthread_create(&lmkd_tid, nullptr, run_lmkd_stub_server, nullptr) == 0) {
         pthread_detach(lmkd_tid);
+    }
+    pthread_t mdns_tid;
+    if (pthread_create(&mdns_tid, nullptr, run_mdns_stub_server, nullptr) == 0) {
+        pthread_detach(mdns_tid);
     }
     ProcessState::self()->startThreadPool();
     auto sm = defaultServiceManager();
