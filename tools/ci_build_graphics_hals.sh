@@ -452,9 +452,7 @@ public:
                 // First payload word: 1 (true) for code==1 when requested, else 0.
                 // Trailing zero words safely satisfy void, bool, int32, int64, empty String, or empty array.
                 reply->writeInt32((code1_true_ && code == 1) ? 1 : 0);
-                reply->writeInt32(0);
-                reply->writeInt32(0);
-                reply->writeInt32(0);
+                for (int i = 0; i < 7; ++i) reply->writeInt32(0);
             }
             return android::OK;
         }
@@ -598,7 +596,11 @@ int main() {
                        new VGuestStubBinder("android.net.INetd", true, 7));
         sm->addService(String16("dnsresolver"),
                        new VGuestStubBinder("android.net.IDnsResolver", true, 9));
-        ALOGI("VGuest suspend@1.0: registered suspend_control + suspend_control_internal + vold + storaged + netd + dnsresolver");
+        sm->addService(String16("media.audio_policy"),
+                       new VGuestStubBinder("android.media.IAudioPolicyService", false));
+        sm->addService(String16("media.audio_flinger"),
+                       new VGuestStubBinder("android.media.IAudioFlinger", false));
+        ALOGI("VGuest suspend@1.0: registered suspend_control + vold + storaged + netd + dnsresolver + audio stubs");
     }
 
     configureRpcThreadpool(2, true /* callerWillJoin */);
