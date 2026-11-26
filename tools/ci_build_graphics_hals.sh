@@ -410,38 +410,68 @@ struct VGuestSystemSuspend : public ISystemSuspend {
     }
 };
 
-class VGuestSuspendControlBinder : public BBinder {
+class VGuestStubBinder : public BBinder {
 public:
-    explicit VGuestSuspendControlBinder(bool is_internal) : is_internal_(is_internal) {}
+    VGuestStubBinder(const char* iface, bool code1_true, int32_t iface_version = 0)
+        : iface_(iface), code1_true_(code1_true), iface_version_(iface_version) {}
     status_t onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) override {
         if (code == android::IBinder::INTERFACE_TRANSACTION) {
-            reply->writeString16(String16(is_internal_
-                ? "android.system.suspend.internal.ISuspendControlServiceInternal"
-                : "android.system.suspend.ISuspendControlService"));
+            reply->writeString16(String16(iface_));
+            return android::OK;
+        }
+        // Stable AIDL getInterfaceVersion / getInterfaceHash
+        constexpr uint32_t kGetInterfaceVersion = android::IBinder::FIRST_CALL_TRANSACTION + 16777214;
+        constexpr uint32_t kGetInterfaceHash = android::IBinder::FIRST_CALL_TRANSACTION + 16777213;
+        if (code == kGetInterfaceVersion && iface_version_ > 0) {
+            if (reply) {
+                reply->writeInt32(0);
+                reply->writeInt32(iface_version_);
+            }
+            return android::OK;
+        }
+        if (code == kGetInterfaceHash && iface_version_ > 0) {
+            if (reply) {
+                reply->writeInt32(0);
+                reply->writeString16(String16(""));
+            }
             return android::OK;
         }
         if (code >= android::IBinder::FIRST_CALL_TRANSACTION && code <= android::IBinder::LAST_CALL_TRANSACTION) {
             (void)data;
             if (reply) {
                 reply->writeInt32(0);  // binder::Status::EX_NONE
-                // code 1 is registerCallback / enableAutosuspend -> return true; others -> 0/false/empty vec
-                reply->writeInt32(code == 1 ? 1 : 0);
+                // First payload word: 1 (true) for code==1 when requested, else 0.
+                // Trailing zero words safely satisfy void, bool, int32, int64, empty String, or empty array.
+                reply->writeInt32((code1_true_ && code == 1) ? 1 : 0);
+                reply->writeInt32(0);
+                reply->writeInt32(0);
+                reply->writeInt32(0);
             }
             return android::OK;
         }
         return BBinder::onTransact(code, data, reply, flags);
     }
 private:
-    bool is_internal_;
+    const char* iface_;
+    bool code1_true_;
+    int32_t iface_version_;
 };
 
 int main() {
     ProcessState::self()->startThreadPool();
     auto sm = defaultServiceManager();
     if (sm != nullptr) {
-        sm->addService(String16("suspend_control"), new VGuestSuspendControlBinder(false));
-        sm->addService(String16("suspend_control_internal"), new VGuestSuspendControlBinder(true));
-        ALOGI("VGuest suspend@1.0: registered suspend_control + suspend_control_internal");
+        sm->addService(String16("suspend_control"),
+                       new VGuestStubBinder("android.system.suspend.ISuspendControlService", true));
+        sm->addService(String16("suspend_control_internal"),
+                       new VGuestStubBinder("android.system.suspend.internal.ISuspendControlServiceInternal", true));
+        sm->addService(String16("vold"),
+                       new VGuestStubBinder("android.os.IVold", false));
+        sm->addService(String16("storaged"),
+                       new VGuestStubBinder("android.os.IStoraged", false));
+        sm->addService(String16("netd"),
+                       new VGuestStubBinder("android.net.INetd", true, 7));
+        ALOGI("VGuest suspend@1.0: registered suspend_control + suspend_control_internal + vold + storaged + netd");
     }
 
     configureRpcThreadpool(2, true /* callerWillJoin */);
