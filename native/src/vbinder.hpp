@@ -8,6 +8,7 @@
 #include <sys/epoll.h>
 #include <sys/types.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "binder_abi.hpp"
@@ -149,6 +150,8 @@ private:
         size_t rx_cursor = 0;
         uint32_t max_threads = 15;
         int active_loopers = 0;
+        int requested_loopers = 0;
+        std::unordered_set<pid_t> looper_tids;
         bool spawn_looper_sent = false;
         bool owns_binder_node = false;
         uint32_t next_handle = 1;

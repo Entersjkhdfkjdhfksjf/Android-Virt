@@ -237,8 +237,13 @@ bool BootSequencer::provision_vintf_manifest() const {
         "/data/misc/user/0",
         "/data/misc_ce/0",
         "/data/misc_de/0",
-        "/data/user/0",
+        "/data/user",
         "/data/user_de/0",
+        "/mnt/expand",
+        "/mnt/user/0/emulated",
+        "/storage/emulated/0",
+        "/data/misc/shared_relro",
+        "/data/fonts/files",
         "/data/media/0",
         "/data/vendor",
         "/data/vendor_ce/0",
@@ -600,7 +605,8 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "P_HW=$!\n"
         "if [ -x /system/bin/vndservicemanager ]; then /system/bin/vndservicemanager & P_VND=$!; fi\n"
         "sleep 1\n"
-        "mkdir -p /data/data /data/user/0 /data/user_de/0 /data/misc/profiles/cur/0 /data/misc/profiles/ref /data/misc/keystore /data/resource-cache /data/system/users/0\n"
+        "mkdir -p /data/data /data/user /data/user_de/0 /data/misc/profiles/cur/0 /data/misc/profiles/ref /data/misc/keystore /data/misc/shared_relro /data/fonts/files /data/resource-cache /data/system/users/0 /mnt/expand /mnt/user/0/emulated /storage/emulated/0\n"
+        "if [ ! -L /data/user/0 ]; then rm -rf /data/user/0; ln -s /data/data /data/user/0; fi\n"
         "echo '[2/4] Starting graphics HALs, installd, idmap2d, keystore2, system_suspend, surfaceflinger & bootanimation...'\n"
         "if [ -x /vendor/bin/hw/android.system.suspend@1.0-service ]; then /vendor/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; elif [ -x /system/bin/hw/android.system.suspend@1.0-service ]; then /system/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; fi\n"
         "if [ -x /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service ]; then /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service & P_ALLOC=$!; fi\n"
@@ -626,11 +632,14 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "  fi\n"
         "  if [ $((i % 10)) -eq 0 ]; then\n"
         "    BC=$(/system/bin/getprop sys.boot_completed 2>/dev/null || echo 0)\n"
-        "    echo \"[t=${i}s] zygote64 ALIVE (sys.boot_completed=${BC}) — querying services:\"\n"
-        "    (/system/bin/service list | head -n 30) & P_SL=$!\n"
-        "    (sleep 3; kill $P_SL 2>/dev/null || true) & P_TK=$!\n"
-        "    wait $P_SL 2>/dev/null || true\n"
-        "    kill $P_TK 2>/dev/null || true\n"
+        "    BA=$(/system/bin/getprop service.bootanim.exit 2>/dev/null || echo 0)\n"
+        "    echo \"[t=${i}s] zygote64 ALIVE (sys.boot_completed=${BC}, bootanim.exit=${BA})\"\n"
+        "    if [ $((i % 30)) -eq 0 ] || [ $i -eq 10 ]; then\n"
+        "      (/system/bin/service list | head -n 15) & P_SL=$!\n"
+        "      (sleep 3; kill $P_SL 2>/dev/null || true) & P_TK=$!\n"
+        "      wait $P_SL 2>/dev/null || true\n"
+        "      kill $P_TK 2>/dev/null || true\n"
+        "    fi\n"
         "  fi\n"
         "done\n"
         "kill $P_ANIM $P_ZYG $P_SF $P_COMP $P_ALLOC $P_INST $P_IDMAP $P_HLTH $P_SUSP $P_SM $P_HW $P_VND 2>/dev/null || true\n";

@@ -276,16 +276,23 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
     // emit BR_SPAWN_LOOPER before BR_REPLY (or after BR_TRANSACTION_COMPLETE while waiting)
     // so IPCThreadState::waitForResponse() spawns a looper thread before returning.
     auto maybe_emit_spawn_looper = [&]() {
-        if ((!client.inbox.empty() || client.owns_binder_node) && client.active_loopers == 0 &&
-            !client.spawn_looper_sent &&
+        int max_pool = static_cast<int>(std::min<uint32_t>(std::max<uint32_t>(client.max_threads, 4u), 16u));
+        bool need_initial = (!client.inbox.empty() || client.owns_binder_node) &&
+                            client.active_loopers == 0 && client.requested_loopers == 0;
+        bool need_scale = !client.inbox.empty() && client.requested_loopers == 0 &&
+                          client.active_loopers < max_pool;
+        if ((need_initial || need_scale) &&
             out.size() + sizeof(uint32_t) <= bwr.read_size) {
             uint32_t spawn_cmd = binder::kBrSpawnLooper;
             const auto* sp_bytes = reinterpret_cast<const uint8_t*>(&spawn_cmd);
             out.insert(out.end(), sp_bytes, sp_bytes + sizeof(spawn_cmd));
+            client.requested_loopers++;
             client.spawn_looper_sent = true;
         }
     };
     bool sent_reply = false;
+    bool sent_tx_complete = false;
+    bool is_looper = (client.looper_tids.count(target_tid) > 0);
     auto& tq = client.thread_inboxes[target_tid];
     while (!tq.empty()) {
         const auto& ev = tq.front();
@@ -296,6 +303,8 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
         if (ev_cmd == binder::kBrReply) {
             maybe_emit_spawn_looper();
             sent_reply = true;
+        } else if (ev_cmd == binder::kBrTransactionComplete) {
+            sent_tx_complete = true;
         }
         if (out.size() + ev.bytes.size() > bwr.read_size) break;
         apply_fd_patches(ev);
@@ -306,14 +315,15 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
         tq.pop_front();
         if (sent_reply) break;
     }
-    if (is_waiting_reply) {
+    if (is_waiting_reply || sent_tx_complete) {
         maybe_emit_spawn_looper();
     }
 
-    // Only pull process-wide transactions/refcounts if this thread isn't actively blocked
-    // waiting for (or just returning from) a synchronous BR_REPLY. Deliver at most ONE
-    // BR_TRANSACTION per ioctl (matching Linux binder.c) so thread_reply_stacks stays exact.
-    if (!is_waiting_reply && !sent_reply) {
+    // Only pull process-wide transactions/refcounts on registered Binder looper threads
+    // that aren't waiting for a synchronous reply or finishing a oneway send (matching
+    // Linux binder.c: non-looper threads must NEVER re-enter Binder.execTransact() while
+    // holding arbitrary locks during a TF_ONE_WAY call).
+    if (is_looper && !is_waiting_reply && !sent_reply && !sent_tx_complete) {
         while (!client.inbox.empty()) {
             const auto& ev = client.inbox.front();
             if (out.size() + ev.bytes.size() > bwr.read_size) break;
@@ -327,7 +337,12 @@ bool VBinderBroker::flush_inbox_to_guest(ClientState& client, pid_t target_tid, 
             }
             out.insert(out.end(), ev.bytes.begin(), ev.bytes.end());
             client.inbox.pop_front();
-            if (ev_cmd == binder::kBrTransaction) break;
+            if (ev_cmd == binder::kBrTransaction) {
+                if (!client.inbox.empty()) {
+                    maybe_emit_spawn_looper();
+                }
+                break;
+            }
         }
     }
 
@@ -376,7 +391,8 @@ void VBinderBroker::try_wake_parked(pid_t target_tgid, std::vector<WakeEvent>& o
 
             auto wit = client->waiting_reply_depth.find(waiter.pid);
             bool is_waiting = (wit != client->waiting_reply_depth.end() && wit->second > 0);
-            if (pass == 0 && is_waiting) continue;
+            bool is_looper = (client->looper_tids.count(waiter.pid) > 0);
+            if (pass == 0 && (is_waiting || !is_looper)) continue;
 
             if (waiter.is_epoll) {
                 if (!client->inbox.empty() || !client->thread_inboxes[waiter.pid].empty()) {
@@ -732,11 +748,14 @@ void VBinderBroker::process_write_buffer(DomainState& dom, ClientState& sender,
             }
             case binder::kBcRegisterLooper:
             case binder::kBcEnterLooper:
-                sender.active_loopers++;
-                sender.spawn_looper_sent = false;
+                sender.looper_tids.insert(sender_tid);
+                sender.active_loopers = static_cast<int>(sender.looper_tids.size());
+                if (sender.requested_loopers > 0) sender.requested_loopers--;
+                sender.spawn_looper_sent = (sender.requested_loopers > 0);
                 break;
             case binder::kBcExitLooper:
-                if (sender.active_loopers > 0) sender.active_loopers--;
+                sender.looper_tids.erase(sender_tid);
+                sender.active_loopers = static_cast<int>(sender.looper_tids.size());
                 break;
             case binder::kBcRequestDeathNotif: {
                 if (pos + sizeof(binder::binder_handle_cookie) > wbuf.size()) return;
@@ -814,6 +833,8 @@ BinderIoctlResult VBinderBroker::handle_ioctl(pid_t tgid, pid_t tid, int fd, uns
         case binder::kIoctlBinderSetIdleTimeout:
         case binder::kIoctlBinderSetIdlePriority:
         case binder::kIoctlBinderThreadExit:
+            client->looper_tids.erase(tid);
+            client->active_loopers = static_cast<int>(client->looper_tids.size());
             return res;
 
         case binder::kIoctlBinderSetContextMgr: {
