@@ -646,7 +646,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7aa-symlinkat-hwui-stubs\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7ab-keystore-symlink-fix\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -1684,6 +1684,16 @@ void Supervisor::handle_ptrace_syscall_exit(pid_t pid, ProcessState& proc) {
         reg_dirty = true;
     }
     if (reg_dirty) regs.store(pid);
+
+    if (op.kind == ExitPatchKind::kIgnoreSymlinkEexist && regs.ret() == -EEXIST) {
+        if (op.guest_path == "/data/user/0" ||
+            op.guest_path.rfind("/data/user/", 0) == 0 ||
+            op.guest_path.rfind("/mnt/expand/", 0) == 0) {
+            regs.set_ret(0);
+            regs.store(pid);
+            return;
+        }
+    }
 
     if (regs.ret() < 0) return;
 

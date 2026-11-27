@@ -606,6 +606,12 @@ int main() {
                        new VGuestStubBinder("android.media.IMediaExtractorService", false));
         sm->addService(String16("android.security.keystore"),
                        new VGuestStubBinder("android.security.IKeystoreService", false));
+        sm->addService(String16("android.security.maintenance"),
+                       new VGuestStubBinder("android.security.maintenance.IKeystoreMaintenance", false));
+        sm->addService(String16("android.security.authorization"),
+                       new VGuestStubBinder("android.security.authorization.IKeystoreAuthorization", false));
+        sm->addService(String16("android.security.legacykeystore"),
+                       new VGuestStubBinder("android.security.legacykeystore.ILegacyKeystore", false));
         ALOGI("VGuest suspend@1.0: registered suspend_control + vold + storaged + netd + dnsresolver + audio stubs");
     }
 

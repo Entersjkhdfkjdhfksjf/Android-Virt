@@ -236,6 +236,7 @@ bool BootSequencer::provision_vintf_manifest() const {
         "/data/misc/installd",
         "/data/misc/user/0",
         "/data/misc_ce/0",
+        "/data/misc_ce/0/rollback",
         "/data/misc_de/0",
         "/data/user",
         "/data/user_de/0",
