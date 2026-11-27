@@ -5,6 +5,7 @@
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
+#include <unistd.h>
 
 namespace vguest {
 
@@ -237,6 +238,12 @@ bool BootSequencer::provision_vintf_manifest() const {
         "/data/misc/user/0",
         "/data/misc_ce/0",
         "/data/misc_ce/0/rollback",
+        "/data/misc_ce/0/apexdata/com.android.wifi",
+        "/data/system_ce/0/recent_tasks",
+        "/data_mirror/data_ce/null",
+        "/data_mirror/data_de/null",
+        "/data_mirror/misc_ce/null",
+        "/data_mirror/misc_de/null",
         "/data/misc_de/0",
         "/data/user",
         "/data/user_de/0",
@@ -292,6 +299,20 @@ bool BootSequencer::provision_vintf_manifest() const {
     };
     for (const char* d : dirs) {
         mkdir_p(rootfs_root_ + d);
+    }
+    // Provision /data_mirror/* symlinks required by AOSP 12 Zygote IsolateAppData()
+    const std::pair<const char*, const char*> mirror_links[] = {
+        {"/data_mirror/data_ce/null/0", "/data/data"},
+        {"/data_mirror/data_de/null/0", "/data/user_de/0"},
+        {"/data_mirror/misc_ce/null/0", "/data/misc_ce/0"},
+        {"/data_mirror/misc_de/null/0", "/data/misc_de/0"},
+        {"/data_mirror/cur_profiles", "/data/misc/profiles/cur"},
+        {"/data_mirror/ref_profiles", "/data/misc/profiles/ref"},
+    };
+    for (const auto& [link_rel, target] : mirror_links) {
+        std::string host_link = rootfs_root_ + link_rel;
+        ::unlink(host_link.c_str());
+        (void)::symlink(target, host_link.c_str());
     }
 
     // Populate real /sys/fs/selinux/class/* directories so libselinux discover_class()
@@ -608,6 +629,13 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "sleep 1\n"
         "mkdir -p /data/data /data/user /data/user_de/0 /data/misc/profiles/cur/0 /data/misc/profiles/ref /data/misc/keystore /data/misc/shared_relro /data/fonts/files /data/resource-cache /data/system/users/0 /mnt/expand /mnt/user/0/emulated /storage/emulated/0\n"
         "if [ ! -L /data/user/0 ]; then rm -rf /data/user/0; ln -sfn /data/data /data/user/0; fi\n"
+        "mkdir -p /data_mirror/data_ce/null /data_mirror/data_de/null /data_mirror/misc_ce/null /data_mirror/misc_de/null /data/misc_ce/0/apexdata/com.android.wifi /data/system_ce/0/recent_tasks\n"
+        "ln -sfn /data/data /data_mirror/data_ce/null/0\n"
+        "ln -sfn /data/user_de/0 /data_mirror/data_de/null/0\n"
+        "ln -sfn /data/misc_ce/0 /data_mirror/misc_ce/null/0\n"
+        "ln -sfn /data/misc_de/0 /data_mirror/misc_de/null/0\n"
+        "ln -sfn /data/misc/profiles/cur /data_mirror/cur_profiles\n"
+        "ln -sfn /data/misc/profiles/ref /data_mirror/ref_profiles\n"
         "echo '[2/4] Starting graphics HALs, installd, idmap2d, keystore2, system_suspend, surfaceflinger & bootanimation...'\n"
         "if [ -x /vendor/bin/hw/android.system.suspend@1.0-service ]; then /vendor/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; elif [ -x /system/bin/hw/android.system.suspend@1.0-service ]; then /system/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; fi\n"
         "if [ -x /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service ]; then /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service & P_ALLOC=$!; fi\n"

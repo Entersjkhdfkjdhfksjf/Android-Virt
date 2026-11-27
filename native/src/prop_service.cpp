@@ -381,6 +381,8 @@ void PropertyService::seed_default_aosp12_properties() {
         {"debug.hwui.use_buffer_age", "false"},
         {"debug.hwui.use_partial_updates", "false"},
         {"ro.surface_flinger.use_color_management", "false"},
+        {"ro.surface_flinger.has_wide_color_display", "false"},
+        {"ro.surface_flinger.has_HDR_display", "false"},
         {"ro.opengles.version", "196608"},
         {"ro.sf.lcd_density", "280"},
         {"ro.zygote.disable_gl_preload", "true"},

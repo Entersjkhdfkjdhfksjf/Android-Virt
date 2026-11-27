@@ -445,6 +445,23 @@ public:
             }
             return android::OK;
         }
+        if ((code == 44 || code == 48) && std::strcmp(iface_, "android.media.IAudioPolicyService") == 0) {
+            (void)data;
+            if (reply) {
+                // AOSP 12 IAudioPolicyService::{listAudioPorts(44), listAudioPatches(48)}:
+                // int listAudioPorts(role, type, inout Int count, out AudioPort[] ports, out Int generation)
+                reply->writeInt32(0);  // binder::Status::EX_NONE
+                reply->writeInt32(0);  // return total count = 0
+                reply->writeInt32(1);  // inout Int count: non-null Parcelable
+                reply->writeInt32(8);  // Parcelable payload size (4B header + 4B int32)
+                reply->writeInt32(0);  // count.value = 0
+                reply->writeInt32(0);  // out AudioPort[]/AudioPatch[] empty array
+                reply->writeInt32(1);  // out Int generation: non-null Parcelable
+                reply->writeInt32(8);  // Parcelable payload size
+                reply->writeInt32(1);  // generation.value = 1
+            }
+            return android::OK;
+        }
         if (code >= android::IBinder::FIRST_CALL_TRANSACTION && code <= android::IBinder::LAST_CALL_TRANSACTION) {
             (void)data;
             if (reply) {
