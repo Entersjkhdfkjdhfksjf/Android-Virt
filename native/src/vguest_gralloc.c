@@ -151,7 +151,7 @@ typedef struct vguest_buffer_handle {
 } vguest_buffer_handle_t;
 
 /* ---- Per-process mmap tracking table ---- */
-#define MAX_MAPPED_BUFFERS 512
+#define MAX_MAPPED_BUFFERS 2048
 
 typedef struct mapped_entry {
     const native_handle_t* handle;
@@ -174,9 +174,9 @@ static int validate_handle(buffer_handle_t hnd) {
 }
 
 static mapped_entry_t* find_mapping_locked(buffer_handle_t hnd, int fd) {
+    (void)fd;
     for (int i = 0; i < MAX_MAPPED_BUFFERS; ++i) {
-        if (g_mappings[i].base != NULL &&
-            (g_mappings[i].handle == hnd || g_mappings[i].fd == fd)) {
+        if (g_mappings[i].base != NULL && g_mappings[i].handle == hnd) {
             return &g_mappings[i];
         }
     }

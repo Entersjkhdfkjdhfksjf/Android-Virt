@@ -452,7 +452,7 @@ public:
                 // First payload word: 1 (true) for code==1 when requested, else 0.
                 // Trailing zero words safely satisfy void, bool, int32, int64, empty String, or empty array.
                 reply->writeInt32((code1_true_ && code == 1) ? 1 : 0);
-                for (int i = 0; i < 7; ++i) reply->writeInt32(0);
+                for (int i = 0; i < 32; ++i) reply->writeInt32(0);
             }
             return android::OK;
         }
@@ -604,6 +604,8 @@ int main() {
                        new VGuestStubBinder("android.media.IMediaMetricsService", false));
         sm->addService(String16("media.extractor"),
                        new VGuestStubBinder("android.media.IMediaExtractorService", false));
+        sm->addService(String16("android.security.keystore"),
+                       new VGuestStubBinder("android.security.IKeystoreService", false));
         ALOGI("VGuest suspend@1.0: registered suspend_control + vold + storaged + netd + dnsresolver + audio stubs");
     }
 

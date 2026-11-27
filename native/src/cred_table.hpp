@@ -21,7 +21,8 @@ enum class ExitPatchKind {
     kRegisterInputFd,
     kRegisterUeventFd,
     kUnregisterUeventFd,
-    kStripRootfsSockaddr, // Strip rootfs prefix from getsockname/getpeername AF_UNIX sun_path     // Register returned FD from openat("/dev/input/event*") with VInputHub
+    kStripRootfsSockaddr, // Strip rootfs prefix from getsockname/getpeername AF_UNIX sun_path
+    kIgnoreSymlinkEexist, // Spoof 0 on -EEXIST for shared app-data isolation symlinks (/data/user/*, /mnt/expand/*)
 };
 
 struct PendingExitOp {

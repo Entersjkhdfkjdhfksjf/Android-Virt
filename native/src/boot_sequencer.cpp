@@ -606,7 +606,7 @@ std::string BootSequencer::build_stage_script(BootStage stage) const {
         "if [ -x /system/bin/vndservicemanager ]; then /system/bin/vndservicemanager & P_VND=$!; fi\n"
         "sleep 1\n"
         "mkdir -p /data/data /data/user /data/user_de/0 /data/misc/profiles/cur/0 /data/misc/profiles/ref /data/misc/keystore /data/misc/shared_relro /data/fonts/files /data/resource-cache /data/system/users/0 /mnt/expand /mnt/user/0/emulated /storage/emulated/0\n"
-        "if [ ! -L /data/user/0 ]; then rm -rf /data/user/0; ln -s /data/data /data/user/0; fi\n"
+        "if [ ! -L /data/user/0 ]; then rm -rf /data/user/0; ln -sfn /data/data /data/user/0; fi\n"
         "echo '[2/4] Starting graphics HALs, installd, idmap2d, keystore2, system_suspend, surfaceflinger & bootanimation...'\n"
         "if [ -x /vendor/bin/hw/android.system.suspend@1.0-service ]; then /vendor/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; elif [ -x /system/bin/hw/android.system.suspend@1.0-service ]; then /system/bin/hw/android.system.suspend@1.0-service & P_SUSP=$!; fi\n"
         "if [ -x /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service ]; then /vendor/bin/hw/android.hardware.graphics.allocator@2.0-service & P_ALLOC=$!; fi\n"

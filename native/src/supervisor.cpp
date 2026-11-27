@@ -646,7 +646,7 @@ int Supervisor::run(const std::vector<std::string>& guest_argv,
     }
 
     if (cfg_.verbose) {
-        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7z-mnt-expand-vbinder-pool\n",
+        std::fprintf(stderr, "[guest_runner] transport=%s rootfs=%s vbinder=3-domain build=p7aa-symlinkat-hwui-stubs\n",
                      active == InterceptionTransport::kUserNotif ? "SECCOMP_RET_USER_NOTIF"
                                                                  : "SECCOMP_RET_TRACE+ptrace",
                      cfg_.rootfs_root.c_str());
@@ -1218,8 +1218,38 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
             return;
         }
     }
-    if (nr == SYS_setgroups ||
-        nr == SYS_mount || nr == SYS_umount2 || nr == SYS_chroot || nr == SYS_pivot_root ||
+    if (nr == SYS_setgroups) {
+        size_t ng = static_cast<size_t>(regs.arg(0));
+        uint64_t list_ptr = regs.arg(1);
+        proc.creds.groups.clear();
+        if (ng > 0 && ng <= 64 && list_ptr != 0) {
+            std::vector<uint32_t> gids(ng);
+            if (read_guest_mem(pid, list_ptr, gids.data(), ng * sizeof(uint32_t))) {
+                proc.creds.groups = std::move(gids);
+            }
+        }
+        skip_with_ret(0);
+        return;
+    }
+    if (nr == SYS_getgroups) {
+        int size = static_cast<int>(regs.arg(0));
+        uint64_t list_ptr = regs.arg(1);
+        const auto& gids = proc.creds.groups;
+        if (size == 0) {
+            skip_with_ret(static_cast<int64_t>(gids.size()));
+            return;
+        }
+        if (size < 0 || static_cast<size_t>(size) < gids.size()) {
+            skip_with_ret(-EINVAL);
+            return;
+        }
+        if (!gids.empty() && list_ptr != 0) {
+            write_guest_mem(pid, list_ptr, gids.data(), gids.size() * sizeof(uint32_t));
+        }
+        skip_with_ret(static_cast<int64_t>(gids.size()));
+        return;
+    }
+    if (nr == SYS_mount || nr == SYS_umount2 || nr == SYS_chroot || nr == SYS_pivot_root ||
         nr == SYS_sethostname || nr == SYS_setdomainname || nr == SYS_unshare) {
         skip_with_ret(0);
         return;
@@ -1403,7 +1433,11 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
                                      -1, 0, out_buf, out_len, tp.guest_path, bdom, bbacking};
     };
 
-    if (nr == SYS_openat) {
+    if (nr == SYS_openat
+#ifdef SYS_openat2
+        || nr == SYS_openat2
+#endif
+    ) {
         rewrite_path_arg(0, 1, true, ExitPatchKind::kRestoreRegOnly, 0, 0);
         return;
     }
@@ -1477,6 +1511,35 @@ void Supervisor::handle_ptrace_seccomp_entry(pid_t pid, ProcessState& proc) {
         if (nr == SYS_unlinkat && !proc.exit_op.guest_path.empty()) {
             runtime_meta_.erase(proc.exit_op.guest_path);
         }
+        return;
+    }
+    if (nr == SYS_symlinkat) {
+        // symlinkat(target, newdirfd, linkpath): keep guest target verbatim, rewrite linkpath into rootfs.
+        rewrite_path_arg(1, 2, false, ExitPatchKind::kIgnoreSymlinkEexist, 0, 0);
+        return;
+    }
+    if (nr == SYS_linkat) {
+        std::string raw_old, raw_new;
+        if (!read_guest_cstring(pid, regs.arg(1), raw_old) ||
+            !read_guest_cstring(pid, regs.arg(3), raw_new)) return;
+        bool follow_old = (regs.arg(4) & AT_SYMLINK_FOLLOW) != 0;
+        TranslatedPath tp_old = translator_.translate(pid, static_cast<int>(regs.arg(0)), raw_old, follow_old);
+        TranslatedPath tp_new = translator_.translate(pid, static_cast<int>(regs.arg(2)), raw_new, false);
+        std::string s_old = tp_old.host_path; s_old.push_back('\0');
+        std::string s_new = tp_new.host_path; s_new.push_back('\0');
+        size_t total = s_old.size() + s_new.size();
+        uint64_t scratch = scratch_addr_below_sp(regs.sp(), total);
+        std::vector<uint8_t> blob(total);
+        std::memcpy(blob.data(), s_old.data(), s_old.size());
+        std::memcpy(blob.data() + s_old.size(), s_new.data(), s_new.size());
+        if (!write_guest_mem(pid, scratch, blob.data(), blob.size())) return;
+        uint64_t orig1 = regs.arg(1), orig3 = regs.arg(3);
+        regs.set_arg(1, scratch);
+        regs.set_arg(3, scratch + s_old.size());
+        regs.store(pid);
+        proc.expecting_syscall_exit = true;
+        proc.exit_op = PendingExitOp{ExitPatchKind::kRestoreRegOnly,
+                                     1, orig1, 3, orig3, 0, 0, tp_new.guest_path, 0, ""};
         return;
     }
     if (false
