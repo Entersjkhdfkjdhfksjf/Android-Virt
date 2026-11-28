@@ -13,8 +13,8 @@ namespace vguest {
 enum class ExitPatchKind {
     kNone,
     kRestoreRegOnly,      // Restore original register(s) after rewritten path/sockaddr pointer
-    kPatchStatBuf,        // Patch struct stat (newfstatat) from VfsMetaDb
-    kPatchStatxBuf,       // Patch struct statx from VfsMetaDb
+    kPatchStatBuf,        // Patch struct stat (newfstatat) from VfsMetaDb / RuntimeMetaStore
+    kPatchStatxBuf,       // Patch struct statx from VfsMetaDb / RuntimeMetaStore
     kStripRootfsGetcwd,   // Rewrite getcwd() output buffer to strip host rootfs prefix
     kStripRootfsReadlink, // Rewrite readlinkat() output buffer if it leaked host rootfs
     kRegisterBinderFd,    // Register returned FD from openat("/dev/*binder") with VBinderBroker
@@ -23,6 +23,11 @@ enum class ExitPatchKind {
     kUnregisterUeventFd,
     kStripRootfsSockaddr, // Strip rootfs prefix from getsockname/getpeername AF_UNIX sun_path
     kIgnoreSymlinkEexist, // Spoof 0 on -EEXIST for shared app-data isolation symlinks (/data/user/*, /mnt/expand/*)
+    kRecordCreatedMeta,   // Record proc.creds.euid/egid for newly created path on exit
+    kRecordChmodMeta,     // Record chmod/fchmodat mode bits on exit
+    kLinkMeta,            // Copy metadata from aux_guest_path -> guest_path on linkat exit
+    kRenameMeta,          // Move metadata from aux_guest_path -> guest_path on renameat/renameat2 exit
+    kUnlinkMeta,          // Erase metadata for guest_path on unlinkat exit
 };
 
 struct PendingExitOp {
@@ -36,6 +41,8 @@ struct PendingExitOp {
     std::string guest_path;
     uint8_t binder_domain = 0;
     std::string binder_backing_path;
+    std::string aux_guest_path;
+    uint64_t aux_u64 = 0;
 };
 
 struct VirtualCreds {

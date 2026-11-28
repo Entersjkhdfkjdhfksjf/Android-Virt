@@ -1,6 +1,7 @@
 #include "path_translator.hpp"
 
 #include <climits>
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -59,12 +60,32 @@ bool is_virtual_binder_path(std::string_view p) {
     return p == "/dev/binder" || p == "/dev/hwbinder" || p == "/dev/vndbinder";
 }
 
+bool strip_rootfs_prefix(std::string_view norm, const std::string& prefix, std::string& out) {
+    if (prefix.empty()) return false;
+    if (norm == prefix) {
+        out = "/";
+        return true;
+    }
+    if (starts_with(norm, prefix) && norm.size() > prefix.size() && norm[prefix.size()] == '/') {
+        out = std::string(norm.substr(prefix.size()));
+        return true;
+    }
+    return false;
+}
+
 }  // namespace
 
 PathTranslator::PathTranslator(std::string rootfs_root)
     : rootfs_root_(normalize_posix(rootfs_root)) {
     if (rootfs_root_.size() > 1 && rootfs_root_.back() == '/') {
         rootfs_root_.pop_back();
+    }
+    char real_buf[PATH_MAX];
+    if (::realpath(rootfs_root_.c_str(), real_buf) != nullptr) {
+        std::string canon = normalize_posix(real_buf);
+        if (canon != rootfs_root_) {
+            canonical_rootfs_root_ = std::move(canon);
+        }
     }
 }
 
@@ -100,10 +121,10 @@ std::string PathTranslator::normalize_posix(std::string_view path) {
 
 std::string PathTranslator::host_to_guest(std::string_view host_path) const {
     std::string norm = normalize_posix(host_path);
-    if (norm == rootfs_root_) return "/";
-    if (starts_with(norm, rootfs_root_) && norm.size() > rootfs_root_.size() &&
-        norm[rootfs_root_.size()] == '/') {
-        return norm.substr(rootfs_root_.size());
+    std::string stripped;
+    if (strip_rootfs_prefix(norm, rootfs_root_, stripped) ||
+        strip_rootfs_prefix(norm, canonical_rootfs_root_, stripped)) {
+        return stripped;
     }
     return norm;
 }
@@ -205,12 +226,7 @@ std::string PathTranslator::resolve_symlinks_in_rootfs(std::string_view guest_ab
 
 TranslatedPath PathTranslator::translate_absolute(std::string_view guest_abs,
                                                   bool follow_final_symlink) const {
-    std::string norm = normalize_posix(guest_abs);
-    if (norm == rootfs_root_ ||
-        (starts_with(norm, rootfs_root_) && norm.size() > rootfs_root_.size() &&
-         norm[rootfs_root_.size()] == '/')) {
-        norm = host_to_guest(norm);
-    }
+    std::string norm = host_to_guest(guest_abs);
     PathKind initial_kind = classify_guest_path(norm);
     if (initial_kind != PathKind::kNormalRootfs) {
         std::string host = (initial_kind == PathKind::kVirtualInput) ? (rootfs_root_ + norm) : norm;

@@ -52,6 +52,7 @@ private:
     PathKind classify_guest_path(std::string_view guest_abs) const;
 
     std::string rootfs_root_;
+    std::string canonical_rootfs_root_;
 };
 
 }  // namespace vguest

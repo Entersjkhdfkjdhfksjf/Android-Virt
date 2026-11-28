@@ -11,6 +11,7 @@ add_library(vguest_core STATIC
     src/path_translator.cpp
     src/prop_service.cpp
     src/pseudo_fs.cpp
+    src/runtime_meta.cpp
     src/seccomp_bpf.cpp
     src/supervisor.cpp
     src/vbinder.cpp

@@ -10,6 +10,7 @@
 #include "path_translator.hpp"
 #include "prop_service.hpp"
 #include "pseudo_fs.hpp"
+#include "runtime_meta.hpp"
 #include "seccomp_bpf.hpp"
 #include "vbinder.hpp"
 #include "logd_sink.hpp"
@@ -17,13 +18,6 @@
 #include "vfs_meta_format.hpp"
 
 namespace vguest {
-
-struct RuntimeStatMeta {
-    uid_t uid = 0;
-    gid_t gid = 0;
-    bool has_uid = false;
-    bool has_gid = false;
-};
 
 struct SupervisorConfig {
     std::string rootfs_root;
@@ -52,6 +46,9 @@ private:
     bool read_guest_mem(pid_t pid, uint64_t addr, void* out, size_t len) const;
     bool write_guest_mem(pid_t pid, uint64_t addr, const void* data, size_t len) const;
     bool read_guest_cstring(pid_t pid, uint64_t addr, std::string& out, size_t max_len = 4096) const;
+    std::string resolve_fd_guest_path(pid_t pid, int fd) const;
+    bool apply_virtual_stat_meta(const std::string& guest_path, uint32_t& uid,
+                                 uint32_t& gid, uint32_t& mode_perm) const;
     static uint64_t find_guest_mmap_base(pid_t pid, const std::string& path_substr);
     bool init_fd_relay();
     void close_fd_relay();
@@ -66,7 +63,7 @@ private:
 
     SupervisorConfig cfg_;
     VfsMetaDb meta_db_;
-    std::unordered_map<std::string, RuntimeStatMeta> runtime_meta_;
+    RuntimeMetaStore runtime_meta_;
     PathTranslator translator_;
     PseudoFs pseudo_fs_;
     PropertyService prop_service_;
